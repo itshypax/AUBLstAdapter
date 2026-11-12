@@ -19,6 +19,8 @@ Eine einzelne `emlst-adapter.exe`, ohne .NET und ohne Installation.
 
 Spielordner und Config wählen (beides merkt sich der Adapter), optional eine PIN eintragen und "Token anfordern" drücken. Ab dann läuft die Verbindung. "Leitstelle öffnen" öffnet die Leitstelle im Browser und kopiert den Link, "Spiel starten" startet `Em4.exe` mit der Mod.
 
+Befehle der Leitstelle holt der Adapter nur ab, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
+
 Fehler stehen unten im Fenster und in `error.log` neben der Exe.
 
 Wer bisher den C#-Adapter benutzt hat, muss nichts neu einstellen: Spielordner und Config liegen unter demselben Registry-Schlüssel (`HKCU\Software\EMLst`).

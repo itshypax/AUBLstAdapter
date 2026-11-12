@@ -149,7 +149,7 @@ impl AdapterApp {
             mod_id: plain(&config.mod_id),
             http: self.http.clone(),
             stop: Arc::new(AtomicBool::new(false)),
-            sync_lock: Arc::new(Mutex::new(())),
+            sync: Arc::new(Mutex::new(false)),
             status: self.status.clone(),
         };
 

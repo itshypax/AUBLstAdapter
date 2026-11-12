@@ -872,13 +872,14 @@ dependencies = [
 
 [[package]]
 name = "emlst-adapter"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "eframe",
  "rfd",
  "serde_json",
  "ureq",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 

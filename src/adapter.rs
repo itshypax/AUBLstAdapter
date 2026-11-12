@@ -22,8 +22,10 @@ pub struct Session {
     pub mod_id: String,
     pub http: ureq::Agent,
     pub stop: Arc<AtomicBool>,
-    // The log thread (handshake) and the command thread both write the sync file.
-    pub sync_lock: Arc<Mutex<()>>,
+    /// Guards the sync file, which both threads write. The flag says whether a game
+    /// round is reading it: commands written outside a round are wiped by the next
+    /// handshake while the server already counts them as delivered.
+    pub sync: Arc<Mutex<bool>>,
     pub status: Arc<Mutex<String>>,
 }
 
@@ -52,8 +54,35 @@ impl Session {
     }
 
     pub fn write_sync(&self, lines: &[String], truncate: bool) -> io::Result<()> {
-        let _guard = self.sync_lock.lock().unwrap();
+        let _guard = self.sync.lock().unwrap();
         write_sync_file(&self.sync_file, lines, truncate)
+    }
+
+    fn round_active(&self) -> bool {
+        *self.sync.lock().unwrap()
+    }
+
+    fn set_round(&self, active: bool) {
+        *self.sync.lock().unwrap() = active;
+    }
+
+    /// Answers the game's handshake. From here on the game reads the sync file from the start.
+    fn handshake(&self, text: &str) -> io::Result<()> {
+        let mut active = self.sync.lock().unwrap();
+        write_sync_file(&self.sync_file, &[format!("42|{text}")], true)?;
+        *active = true;
+        Ok(())
+    }
+
+    /// Writes commands only while a round is running. Ok(false) means nothing was
+    /// written, so the commands must stay unacknowledged.
+    fn deliver(&self, lines: &[String]) -> io::Result<bool> {
+        let active = self.sync.lock().unwrap();
+        if !*active {
+            return Ok(false);
+        }
+        write_sync_file(&self.sync_file, lines, false)?;
+        Ok(true)
     }
 }
 
@@ -138,9 +167,20 @@ pub struct Batch {
     messages: Vec<Value>,
     players: Map<String, Value>,
     time: Map<String, Value>,
+    rejections: u32,
 }
 
+/// How often the server may answer a sync without "ok" before the batch is dropped.
+/// A batch the server can't take would otherwise block every later update.
+const MAX_REJECTIONS: u32 = 5;
+
 impl Batch {
+    /// Counts a sync the server answered without "ok". True once the batch should be dropped.
+    pub fn rejected(&mut self) -> bool {
+        self.rejections += 1;
+        self.rejections >= MAX_REJECTIONS
+    }
+
     /// Takes one log line. Returns the handshake text when the game announced a new
     /// round, which the caller answers through the sync file.
     pub fn process_line(&mut self, line: &str) -> Option<String> {
@@ -207,26 +247,31 @@ impl Batch {
 }
 
 /// Reads the complete lines added since `pos`. A line the game is still writing stays
-/// in the file for the next call instead of being cut in half.
-pub fn read_new_lines(path: &Path, pos: &mut u64) -> io::Result<Vec<String>> {
+/// in the file for the next call instead of being cut in half. The flag is true when
+/// the log started over, which means the game was restarted.
+pub fn read_new_lines(path: &Path, pos: &mut u64) -> io::Result<(Vec<String>, bool)> {
     let mut file = File::open(path)?;
-    // The game starts its log over on every launch. Holding on to the old position
-    // would seek past the end of the new one and miss the next handshake.
-    if file.metadata()?.len() < *pos {
+    // Holding on to the old position would seek past the end of the new log and miss
+    // the next handshake.
+    let restarted = file.metadata()?.len() < *pos;
+    if restarted {
         *pos = 0;
     }
     file.seek(SeekFrom::Start(*pos))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     let Some(last_newline) = buf.iter().rposition(|b| *b == b'\n') else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), restarted));
     };
     let complete = &buf[..=last_newline];
     *pos += complete.len() as u64;
-    Ok(String::from_utf8_lossy(complete)
+    let lines = String::from_utf8_lossy(complete)
         .lines()
-        .map(|l| l.trim_end_matches('\r').to_string())
-        .collect())
+        // A game that keeps writing at its own offset after we emptied the log at
+        // start leaves a run of NUL bytes in front of its next line.
+        .map(|l| l.trim_start_matches('\0').trim_end_matches('\r').to_string())
+        .collect();
+    Ok((lines, restarted))
 }
 
 /// Appends command lines and the "+" end marker the game stops reading at.
@@ -303,14 +348,25 @@ pub fn run_log_monitor(s: Session) {
     }
     let mut pos = 0;
     let mut batch = Batch::default();
+    // Set after the game restarted: until its handshake, commands would be wiped.
+    // At adapter start this is unknown, so a game already in its round (it sends
+    // data without a new handshake) opens the sync file as well.
+    let mut awaiting_handshake = false;
     while !s.stopped() {
         match read_new_lines(&log, &mut pos) {
-            Ok(lines) => {
+            Ok((lines, restarted)) => {
+                if restarted {
+                    awaiting_handshake = true;
+                    s.set_round(false);
+                }
                 for line in lines {
                     if let Some(handshake) = batch.process_line(&line) {
-                        if let Err(e) = s.write_sync(&[format!("42|{handshake}")], true) {
-                            s.fail(format!("Sync-Datei: {e}"));
+                        match s.handshake(&handshake) {
+                            Ok(()) => awaiting_handshake = false,
+                            Err(e) => s.fail(format!("Sync-Datei: {e}")),
                         }
+                    } else if line.starts_with(MARKER) && !awaiting_handshake && !s.round_active() {
+                        s.set_round(true);
                     }
                 }
             }
@@ -318,13 +374,26 @@ pub fn run_log_monitor(s: Session) {
         }
         if batch.has_data() {
             let url = format!("{}?action=sync", s.api);
-            match post(&s.http, &url, &batch.payload(&s.token, &s.mod_id)) {
+            let payload = batch.payload(&s.token, &s.mod_id);
+            match post(&s.http, &url, &payload) {
                 // Only drop what the server confirmed; anything else goes out again next round.
                 Ok(res) if res["ok"] == true => {
                     batch = Batch::default();
                     s.report(format!("Verbunden, zuletzt gesendet {}", chrono::Local::now().format("%H:%M:%S")));
                 }
-                Ok(res) => s.fail(format!("Sync abgelehnt: {res}")),
+                Ok(res) => {
+                    if batch.rejected() {
+                        let mut dropped = payload.to_string();
+                        dropped.truncate(dropped.floor_char_boundary(4000));
+                        s.fail(format!(
+                            "Sync {MAX_REJECTIONS}-mal abgelehnt, Daten verworfen. Antwort: {res}. Daten: {dropped}"
+                        ));
+                        batch = Batch::default();
+                    } else {
+                        s.fail(format!("Sync abgelehnt: {res}"));
+                    }
+                }
+                // Network trouble is no verdict on the data; keep retrying.
                 Err(e) => s.fail(format!("Sync fehlgeschlagen: {e}")),
             }
         }
@@ -342,7 +411,45 @@ pub fn run_command_poller(s: Session) {
     }
 }
 
+/// Whether Em4.exe runs. A closed game leaves its log untouched, so the log alone can't
+/// tell that the round is over; only the next game's handshake would, and that one
+/// wipes whatever was delivered in between.
+fn game_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: plain Win32 calls on a snapshot handle we own and close; entry.dwSize is
+    // set as the API requires.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return true; // can't tell, so don't hold commands back
+        }
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = false;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
+            if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("Em4.exe") {
+                found = true;
+                break;
+            }
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
 fn poll_commands(s: &Session) -> Result<(), String> {
+    if !game_running() {
+        s.set_round(false);
+    }
+    // Outside a round the commands stay on the server until the game is there to read them.
+    if !s.round_active() {
+        return Ok(());
+    }
     let url = format!("{}?action=commands_pending", s.api);
     let res: Value = s
         .http
@@ -368,8 +475,11 @@ fn poll_commands(s: &Session) -> Result<(), String> {
     if lines.is_empty() {
         return Ok(());
     }
-    // Acknowledge only what reached the file; the rest comes again next poll.
-    s.write_sync(&lines, false).map_err(|e| format!("Sync-Datei: {e}"))?;
+    // Acknowledge only what reached the file; the rest comes again next poll. The round
+    // may have ended while the request ran, so `deliver` checks once more under the lock.
+    if !s.deliver(&lines).map_err(|e| format!("Sync-Datei: {e}"))? {
+        return Ok(());
+    }
     post(
         &s.http,
         &format!("{}?action=commands_ack", s.api),
@@ -483,11 +593,48 @@ mod tests {
         let p = temp("log.txt");
         std::fs::write(&p, "eins\r\nzw").unwrap();
         let mut pos = 0;
-        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), vec!["eins"]);
+        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), (vec!["eins".to_string()], false));
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"ei\r\n").unwrap();
-        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), vec!["zwei"]);
-        assert!(read_new_lines(&p, &mut pos).unwrap().is_empty());
+        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), (vec!["zwei".to_string()], false));
+        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), (vec![], false));
         std::fs::write(&p, "neu\n").unwrap();
-        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), vec!["neu"]);
+        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), (vec!["neu".to_string()], true));
+        std::fs::write(&p, b"neu\n\0\0\0!LSTcmd::v{}\n").unwrap();
+        assert_eq!(read_new_lines(&p, &mut pos).unwrap(), (vec!["!LSTcmd::v{}".to_string()], false));
+    }
+
+    #[test]
+    fn batch_is_dropped_after_repeated_rejections() {
+        let mut b = Batch::default();
+        for _ in 1..MAX_REJECTIONS {
+            assert!(!b.rejected());
+        }
+        assert!(b.rejected());
+    }
+
+    #[test]
+    fn commands_only_reach_the_file_during_a_round() {
+        let sync_file = temp("round.txt");
+        let s = Session {
+            api: String::new(),
+            game_dir: PathBuf::new(),
+            sync_file: sync_file.clone(),
+            token: String::new(),
+            mod_id: String::new(),
+            http: ureq::Agent::new_with_defaults(),
+            stop: Arc::new(AtomicBool::new(false)),
+            sync: Arc::new(Mutex::new(false)),
+            status: Arc::new(Mutex::new(String::new())),
+        };
+        assert!(!s.deliver(&["204|1|".into()]).unwrap());
+        assert!(!sync_file.exists());
+
+        s.handshake("7|x").unwrap();
+        assert!(s.deliver(&["204|1|".into()]).unwrap());
+        assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|7|x\r\n204|1|\r\n+\r\n");
+
+        s.set_round(false);
+        assert!(!s.deliver(&["204|2|".into()]).unwrap());
+        assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|7|x\r\n204|1|\r\n+\r\n");
     }
 }

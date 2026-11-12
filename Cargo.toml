@@ -1,6 +1,6 @@
 [package]
 name = "emlst-adapter"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2024"
 
 [dependencies]
@@ -9,6 +9,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["accesskit"
 rfd = "0.18.0"
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 ureq = { version = "3.5.1", features = ["json"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 winreg = "0.56.0"
 
 [profile.release]
