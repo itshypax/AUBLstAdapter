@@ -57,6 +57,12 @@ namespace EMLst
                     // Open the file in read mode
                     using (FileStream fs = new FileStream(basepath+"\\"+logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
+                        // The game starts its log over on every launch. Holding on to the
+                        // old position would seek past the end of the new one, and we would
+                        // never see the handshake of the next round, let alone anything else.
+                        if (fs.Length < lastPosition)
+                            lastPosition = 0;
+
                         // Set the position to the last saved position
                         fs.Seek(lastPosition, SeekOrigin.Begin);
 

@@ -37,12 +37,14 @@ namespace EMLst
             Task.Run(() => CheckMessages(cancellationTokenSource.Token), cancellationTokenSource.Token);
         }
 
+        // Do not truncate the sync file here. A running game holds a byte offset
+        // into it and would seek past the end afterwards, so every command we
+        // write from then on is lost without any error on either side. Only the
+        // handshake (LogFileMonitor, case 'i') may clear it, because that is the
+        // one moment the game starts reading at zero again.
         public void clearSyncFile()
         {
-            System.IO.File.WriteAllText(basepath + "\\" + filePath, string.Empty);
-
             _ = WriteMessagesToFileAsync([], basepath, MessageChecker.filePath);
-
         }
 
         public void StopMonitoring()
@@ -157,7 +159,7 @@ namespace EMLst
                 try
                 {
                     // Ensure we don't start appending with two empty lines at the end already.
-                    TrimOneTrailingNewLineIfDouble(path);
+                    TrimTerminalMarker(path);
 
                     using (var writer = new StreamWriter(path, append: true, encoding: new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))//
                     {
@@ -181,50 +183,41 @@ namespace EMLst
         }
 
         /// <summary>
-        /// If the file currently ends with two newline sequences in a row (i.e., a blank last line),
-        /// trim one newline sequence so we start appending cleanly. Uses Environment.NewLine.
+        /// Cut off the trailing "+" line, the marker the game stops reading at, so the
+        /// next commands land exactly where it stopped. Takes the marker with or
+        /// without a line break around it, in any flavour: the game reads the file in
+        /// text mode and only looks at the "+", and a marker we fail to cut blocks it
+        /// for the rest of the round.
         /// </summary>
-        private static void TrimOneTrailingNewLineIfDouble(string path)
+        private static void TrimTerminalMarker(string path)
         {
             if (!File.Exists(path))
                 return;
 
-            var nl = Encoding.UTF8.GetBytes(Environment.NewLine);
-            var plus = Encoding.UTF8.GetBytes("+");
-            var need = nl.Length * 2+plus.Length;
-
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
             {
-                if (fs.Length < need)
+                var window = (int)Math.Min(fs.Length, 4); // at most "\n+\r\n"
+                if (window == 0)
                     return;
 
-                // Read the last 2 newline sequences' worth of bytes.
-                fs.Seek(-need, SeekOrigin.End);
-                var tail = new byte[need];
-                var read = fs.Read(tail, 0, tail.Length);
-                if (read != tail.Length)
+                fs.Seek(-window, SeekOrigin.End);
+                var tail = new byte[window];
+                if (fs.Read(tail, 0, window) != window)
                     return;
 
-                bool endsWithDouble =
-                    StartsWithSlice(tail, 0, nl) &&
-                    StartsWithSlice(tail, nl.Length, plus) &&
-                    StartsWithSlice(tail, nl.Length+plus.Length, nl);
-                Console.WriteLine($"Rewriting!: {endsWithDouble}");
+                var end = window;
+                if (tail[end - 1] == (byte)'\n') end--;
+                if (end > 0 && tail[end - 1] == (byte)'\r') end--;
+                if (end == 0 || tail[end - 1] != (byte)'+')
+                    return;
 
-                if (endsWithDouble)
-                {
-                    // Trim exactly one newline sequence (so EOF ends with a single newline).
-                    fs.SetLength(fs.Length - nl.Length-plus.Length);
-                }
+                long markerStart = fs.Length - window + end - 1;
+                // A data line ending in "+" is no marker.
+                if (markerStart > 0 && tail[end - 2] != (byte)'\n')
+                    return;
+
+                fs.SetLength(markerStart);
             }
-        }
-
-        private static bool StartsWithSlice(byte[] buffer, int offset, byte[] slice)
-        {
-            if (offset + slice.Length > buffer.Length) return false;
-            for (int i = 0; i < slice.Length; i++)
-                if (buffer[offset + i] != slice[i]) return false;
-            return true;
         }
     }
 }
