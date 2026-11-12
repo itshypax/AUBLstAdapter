@@ -1,0 +1,17 @@
+[package]
+name = "emlst-adapter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+rfd = "0.18.0"
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+ureq = { version = "3.5.1", features = ["json"] }
+winreg = "0.56.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
