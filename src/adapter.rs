@@ -39,8 +39,7 @@ impl Session {
     }
 
     fn fail(&self, text: String) {
-        log_error(&text);
-        self.report(text);
+        fail(&self.status, text);
     }
 
     /// Sleeps in short steps so closing the window doesn't wait for a full interval.
@@ -86,19 +85,62 @@ impl Session {
     }
 }
 
-pub fn post(http: &ureq::Agent, url: &str, body: &Value) -> Result<Value, String> {
-    let mut res = http.post(url).send_json(body).map_err(|e| format!("{url}: {e}"))?;
-    res.body_mut().read_json::<Value>().map_err(|e| format!("{url}: {e}"))
+#[derive(Debug)]
+pub struct HttpError {
+    /// The server answered, so sending the same data again won't help. False for
+    /// connection trouble, which is worth retrying.
+    pub rejected: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// AUBLst reports errors as HTTP 4xx/5xx; their body says why, so it ends up in the message.
+fn reply(url: &str, res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, HttpError> {
+    let failed = |e: ureq::Error| HttpError {
+        rejected: matches!(e, ureq::Error::StatusCode(_)),
+        message: format!("{url}: {e}"),
+    };
+    let mut res = res.map_err(failed)?;
+    let status = res.status();
+    let body = res.body_mut().read_to_string().map_err(failed)?;
+    let rejected = |why: String| {
+        let mut message = format!("{url}: {why}: {body}");
+        message.truncate(message.floor_char_boundary(500));
+        HttpError { rejected: true, message }
+    };
+    if !status.is_success() {
+        return Err(rejected(format!("HTTP {}", status.as_u16())));
+    }
+    serde_json::from_str(&body).map_err(|e| rejected(e.to_string()))
+}
+
+pub fn post(http: &ureq::Agent, url: &str, body: &Value) -> Result<Value, HttpError> {
+    reply(url, http.post(url).send_json(body))
+}
+
+/// Resolves a relative path against the exe's folder instead of whatever working
+/// directory a launcher picked.
+pub fn beside_exe(path: impl AsRef<Path>) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&path)))
+        .unwrap_or_else(|| path.as_ref().to_path_buf())
 }
 
 pub fn log_error(message: &str) {
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("error.log")))
-        .unwrap_or_else(|| PathBuf::from("error.log"));
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(beside_exe("error.log")) {
         let _ = writeln!(f, "{}: {message}", chrono::Local::now().format("%d.%m.%Y %H:%M:%S"));
     }
+}
+
+pub fn fail(status: &Mutex<String>, text: String) {
+    log_error(&text);
+    *status.lock().unwrap() = text;
 }
 
 /// How a JSON value lands in a command line for the game. Mirrors what the C# adapter
@@ -206,9 +248,9 @@ impl Batch {
             return None;
         };
         match kind {
-            'v' => self.vehicles.push(Value::Object(data)),
+            'v' => merge(&mut self.vehicles, data, "game_vehicle_id"),
             'e' => self.events.push(Value::Object(data)),
-            'h' => self.hospitals.push(Value::Object(data)),
+            'h' => merge(&mut self.hospitals, data, "game_hospital_id"),
             'm' => self.messages.push(Value::Object(data)),
             't' => self.time = data,
             _ => {}
@@ -243,6 +285,18 @@ impl Batch {
             put("time", Value::Object(self.time.clone()));
         }
         data
+    }
+}
+
+/// Keeps one entry per id, newer fields winning, as the server ends up storing it anyway.
+/// While the server is down the game reports every second, and a list of every report
+/// soon outgrows what the server accepts in one request.
+fn merge(list: &mut Vec<Value>, data: Map<String, Value>, key: &str) {
+    let id = data.get(key).map(text);
+    let same = |v: &&mut Value| id.is_some() && v.get(key).map(text) == id;
+    match list.iter_mut().find(same) {
+        Some(Value::Object(old)) => old.extend(data),
+        _ => list.push(Value::Object(data)),
     }
 }
 
@@ -352,59 +406,90 @@ pub fn run_log_monitor(s: Session) {
     // At adapter start this is unknown, so a game already in its round (it sends
     // data without a new handshake) opens the sync file as well.
     let mut awaiting_handshake = false;
+    let mut was_running = game_running();
     while !s.stopped() {
-        match read_new_lines(&log, &mut pos) {
-            Ok((lines, restarted)) => {
-                if restarted {
+        let mut running = game_running();
+        // The shrinking log misses a restart when the new game writes past the old
+        // position within a second. Emptying the log once the game is gone avoids
+        // that; a closed game no longer writes to it.
+        if was_running && !running {
+            match File::create(&log) {
+                Ok(_) => {
+                    pos = 0;
                     awaiting_handshake = true;
                     s.set_round(false);
                 }
-                for line in lines {
-                    if let Some(handshake) = batch.process_line(&line) {
-                        match s.handshake(&handshake) {
-                            Ok(()) => awaiting_handshake = false,
-                            Err(e) => s.fail(format!("Sync-Datei: {e}")),
-                        }
-                    } else if line.starts_with(MARKER) && !awaiting_handshake && !s.round_active() {
-                        s.set_round(true);
-                    }
-                }
+                Err(_) => running = true, // the old process may still hold it, try again next second
             }
+        }
+        was_running = running;
+
+        match read_new_lines(&log, &mut pos) {
+            Ok((lines, restarted)) => take_lines(&s, &mut batch, &lines, restarted, &mut awaiting_handshake),
             Err(e) => s.fail(format!("Logdatei {}: {e}", log.display())),
         }
         if batch.has_data() {
             let url = format!("{}?action=sync", s.api);
             let payload = batch.payload(&s.token, &s.mod_id);
-            match post(&s.http, &url, &payload) {
+            let rejection = match post(&s.http, &url, &payload) {
                 // Only drop what the server confirmed; anything else goes out again next round.
                 Ok(res) if res["ok"] == true => {
                     batch = Batch::default();
                     s.report(format!("Verbunden, zuletzt gesendet {}", chrono::Local::now().format("%H:%M:%S")));
+                    None
                 }
-                Ok(res) => {
-                    if batch.rejected() {
-                        let mut dropped = payload.to_string();
-                        dropped.truncate(dropped.floor_char_boundary(4000));
-                        s.fail(format!(
-                            "Sync {MAX_REJECTIONS}-mal abgelehnt, Daten verworfen. Antwort: {res}. Daten: {dropped}"
-                        ));
-                        batch = Batch::default();
-                    } else {
-                        s.fail(format!("Sync abgelehnt: {res}"));
-                    }
-                }
+                Ok(res) => Some(res.to_string()),
+                Err(e) if e.rejected => Some(e.message),
                 // Network trouble is no verdict on the data; keep retrying.
-                Err(e) => s.fail(format!("Sync fehlgeschlagen: {e}")),
+                Err(e) => {
+                    s.fail(format!("Sync fehlgeschlagen: {e}"));
+                    None
+                }
+            };
+            if let Some(answer) = rejection {
+                if batch.rejected() {
+                    let mut dropped = payload.to_string();
+                    dropped.truncate(dropped.floor_char_boundary(4000));
+                    s.fail(format!(
+                        "Sync {MAX_REJECTIONS}-mal abgelehnt, Daten verworfen. Antwort: {answer}. Daten: {dropped}"
+                    ));
+                    batch = Batch::default();
+                } else {
+                    s.fail(format!("Sync abgelehnt: {answer}"));
+                }
             }
         }
         s.pause(Duration::from_secs(1));
     }
 }
 
+/// Feeds new log lines into the batch and decides when the game reads the sync file:
+/// after a restart only its handshake opens the round, otherwise any mod line does.
+fn take_lines(s: &Session, batch: &mut Batch, lines: &[String], restarted: bool, awaiting_handshake: &mut bool) {
+    if restarted {
+        *awaiting_handshake = true;
+        s.set_round(false);
+    }
+    for line in lines {
+        if let Some(handshake) = batch.process_line(line) {
+            match s.handshake(&handshake) {
+                Ok(()) => *awaiting_handshake = false,
+                Err(e) => s.fail(format!("Sync-Datei: {e}")),
+            }
+        } else if line.starts_with(MARKER) && !*awaiting_handshake && !s.round_active() {
+            s.set_round(true);
+        }
+    }
+}
+
 /// Fetches pending commands every five seconds and hands them to the game.
 pub fn run_command_poller(s: Session) {
+    let mut unacked = Vec::new();
     while !s.stopped() {
-        if let Err(e) = poll_commands(&s) {
+        if !game_running() {
+            s.set_round(false);
+        }
+        if let Err(e) = poll_commands(&s, &mut unacked) {
             s.fail(e);
         }
         s.pause(Duration::from_secs(5));
@@ -442,49 +527,49 @@ fn game_running() -> bool {
     }
 }
 
-fn poll_commands(s: &Session) -> Result<(), String> {
-    if !game_running() {
-        s.set_round(false);
-    }
+/// `unacked` holds ids already in the sync file whose ack failed. The server sends them
+/// again until the ack gets through, and writing them twice would run them twice.
+fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
     // Outside a round the commands stay on the server until the game is there to read them.
     if !s.round_active() {
         return Ok(());
     }
     let url = format!("{}?action=commands_pending", s.api);
-    let res: Value = s
-        .http
-        .get(&url)
-        .query("session_token", &s.token)
-        .call()
-        .and_then(|mut r| r.body_mut().read_json::<Value>())
+    let res = reply(&url, s.http.get(&url).query("session_token", &s.token).call())
         .map_err(|e| format!("Befehle abholen: {e}"))?;
-    let Some(commands) = res["commands"].as_array() else {
-        return Ok(());
-    };
     let mut lines = Vec::new();
     let mut ids = Vec::new();
-    for cmd in commands {
+    for cmd in res["commands"].as_array().into_iter().flatten() {
+        let id = text(&cmd["id"]);
+        if unacked.contains(&id) {
+            continue;
+        }
         match command_line(cmd) {
             Some(line) => {
                 lines.push(line);
-                ids.push(Value::String(text(&cmd["id"])));
+                ids.push(id);
             }
             None => log_error(&format!("Befehl nicht verstanden: {cmd}")),
         }
     }
-    if lines.is_empty() {
-        return Ok(());
-    }
     // Acknowledge only what reached the file; the rest comes again next poll. The round
     // may have ended while the request ran, so `deliver` checks once more under the lock.
-    if !s.deliver(&lines).map_err(|e| format!("Sync-Datei: {e}"))? {
+    if !lines.is_empty() {
+        if !s.deliver(&lines).map_err(|e| format!("Sync-Datei: {e}"))? {
+            return Ok(());
+        }
+        unacked.extend(ids);
+    }
+    if unacked.is_empty() {
         return Ok(());
     }
     post(
         &s.http,
         &format!("{}?action=commands_ack", s.api),
-        &json!({ "session_token": s.token, "command_ids": ids }),
-    )?;
+        &json!({ "session_token": s.token, "command_ids": unacked }),
+    )
+    .map_err(|e| format!("Befehle bestätigen: {e}"))?;
+    unacked.clear();
     Ok(())
 }
 
@@ -557,6 +642,16 @@ mod tests {
         let mut only_players = Batch::default();
         only_players.process_line("advertising game info: players=Anna");
         assert!(!only_players.has_data());
+
+        let mut merged = Batch::default();
+        merged.process_line(r#"!LSTcmd::v{"game_vehicle_id":1,"x":1,"s":2}"#);
+        merged.process_line(r#"!LSTcmd::v{"game_vehicle_id":"1","x":5}"#);
+        merged.process_line(r#"!LSTcmd::v{"game_vehicle_id":2}"#);
+        merged.process_line(r#"!LSTcmd::v{"x":3}"#);
+        assert_eq!(
+            merged.payload("t", "m")["vehicles"],
+            json!([{ "game_vehicle_id": "1", "x": 5, "s": 2 }, { "game_vehicle_id": 2 }, { "x": 3 }])
+        );
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -612,20 +707,120 @@ mod tests {
         assert!(b.rejected());
     }
 
-    #[test]
-    fn commands_only_reach_the_file_during_a_round() {
-        let sync_file = temp("round.txt");
-        let s = Session {
-            api: String::new(),
+    fn agent() -> ureq::Agent {
+        ureq::Agent::config_builder().http_status_as_error(false).build().into()
+    }
+
+    fn session(sync_file: &Path, api: &str) -> Session {
+        Session {
+            api: api.into(),
             game_dir: PathBuf::new(),
-            sync_file: sync_file.clone(),
-            token: String::new(),
+            sync_file: sync_file.into(),
+            token: "tok".into(),
             mod_id: String::new(),
-            http: ureq::Agent::new_with_defaults(),
+            http: agent(),
             stop: Arc::new(AtomicBool::new(false)),
             sync: Arc::new(Mutex::new(false)),
             status: Arc::new(Mutex::new(String::new())),
-        };
+        }
+    }
+
+    /// Answers one request per (status, body) in order and returns the raw requests.
+    fn serve(responses: Vec<(&'static str, &'static str)>) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api.php", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = conn.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Some(head_end) = text.find("\r\n\r\n") else { continue };
+                    let length = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+                        .unwrap_or(0);
+                    if n == 0 || request.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                write!(conn, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    .unwrap();
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn server_errors_count_as_rejections() {
+        let (url, server) = serve(vec![
+            ("400 Bad Request", r#"{"error":"PIN fehlt"}"#),
+            ("200 OK", "<b>Warning</b>"),
+            ("500 Internal Server Error", ""),
+            ("200 OK", r#"{"ok":true}"#),
+        ]);
+        let e = post(&agent(), &url, &json!({})).unwrap_err();
+        assert!(e.rejected && e.message.contains("PIN fehlt"), "{e}");
+        assert!(post(&agent(), &url, &json!({})).unwrap_err().rejected);
+        // an agent that turns the status into an error still counts it as the server's answer
+        assert!(post(&ureq::Agent::new_with_defaults(), &url, &json!({})).unwrap_err().rejected);
+        assert_eq!(post(&agent(), &url, &json!({})).unwrap(), json!({ "ok": true }));
+        server.join().unwrap();
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        assert!(!post(&agent(), &format!("http://{closed}/"), &json!({})).unwrap_err().rejected);
+    }
+
+    #[test]
+    fn a_failed_ack_does_not_write_commands_twice() {
+        let pending = r#"{"commands":[{"id":7,"type":"unassign","payload":"{\"game_vehicle_id\":2}"}]}"#;
+        let (url, server) = serve(vec![
+            ("200 OK", pending),
+            ("500 Internal Server Error", ""),
+            ("200 OK", pending),
+            ("200 OK", r#"{"ok":true}"#),
+        ]);
+        let sync_file = temp("ack.txt");
+        let s = session(&sync_file, &url);
+        s.handshake("1|x").unwrap();
+        let mut unacked = Vec::new();
+        assert!(poll_commands(&s, &mut unacked).is_err());
+        assert_eq!(unacked, ["7"]);
+        poll_commands(&s, &mut unacked).unwrap();
+        assert!(unacked.is_empty());
+        assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|1|x\r\n204|2|\r\n+\r\n");
+        let requests = server.join().unwrap();
+        let ack: Value = serde_json::from_str(requests[3].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(ack["command_ids"], json!(["7"]));
+    }
+
+    #[test]
+    fn after_a_restart_only_the_handshake_opens_the_round() {
+        let sync_file = temp("take.txt");
+        let s = session(&sync_file, "");
+        let mut batch = Batch::default();
+        let mut awaiting = false;
+        let data = [r#"!LSTcmd::v{"game_vehicle_id":1}"#.to_string()];
+        // adapter started while a round runs: the game sends data without a new handshake
+        take_lines(&s, &mut batch, &data, false, &mut awaiting);
+        assert!(s.round_active());
+        take_lines(&s, &mut batch, &data, true, &mut awaiting);
+        assert!(!s.round_active());
+        take_lines(&s, &mut batch, &["!LSTcmd::i5|y".into()], false, &mut awaiting);
+        assert!(s.round_active());
+        assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|5|y\r\n+\r\n");
+    }
+
+    #[test]
+    fn commands_only_reach_the_file_during_a_round() {
+        let sync_file = temp("round.txt");
+        let s = session(&sync_file, "");
         assert!(!s.deliver(&["204|1|".into()]).unwrap());
         assert!(!sync_file.exists());
 

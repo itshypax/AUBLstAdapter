@@ -83,6 +83,8 @@ impl AdapterApp {
             session: None,
             http: ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(10)))
+                // AUBLst explains a 4xx in the body; `adapter::reply` reads it.
+                .http_status_as_error(false)
                 .build()
                 .into(),
             status: Arc::new(Mutex::new(String::new())),
@@ -96,12 +98,11 @@ impl AdapterApp {
     }
 
     fn fail(&self, text: String) {
-        log_error(&text);
-        self.set_status(text);
+        adapter::fail(&self.status, text);
     }
 
     fn reload_config(&mut self) {
-        match load_config(Path::new(&self.config_path)) {
+        match load_config(&adapter::beside_exe(&self.config_path)) {
             Ok(c) => {
                 self.set_status("Config geladen, bereit für einen Token.");
                 self.config = Some(c);
