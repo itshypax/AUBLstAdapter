@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,60 @@ use serde_json::{Map, Value, json};
 pub const LOG_FILE: &str = "logfile.txt";
 const MARKER: &str = "!LSTcmd::";
 const PLAYER_MARKER: &str = "advertising game info: players=";
+const LOG_LINES: usize = 1000;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Level {
+    Info,
+    Good,
+    Warn,
+    Bad,
+}
+
+pub struct Entry {
+    pub time: String,
+    pub level: Level,
+    pub text: String,
+}
+
+pub fn now() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// What the window shows. The worker threads write it, the window reads it every frame.
+#[derive(Default)]
+pub struct Shared {
+    pub log: VecDeque<Entry>,
+    pub game_log: VecDeque<String>,
+    pub last_sent: Option<String>,
+    pub server_down_since: Option<String>,
+    pub rejecting: bool,
+    pub round_since: Option<String>,
+    pub delivered: usize,
+    pub unacked: usize,
+}
+
+impl Shared {
+    pub fn push(&mut self, level: Level, text: String) {
+        // A failure that repeats every second would bury everything else.
+        if self.log.back().is_some_and(|e| e.text == text) {
+            return;
+        }
+        if self.log.len() == LOG_LINES {
+            self.log.pop_front();
+        }
+        self.log.push_back(Entry { time: now(), level, text });
+    }
+
+    /// Starts the status over for a new session; both logs stay readable.
+    pub fn reset(&mut self) {
+        *self = Shared {
+            log: std::mem::take(&mut self.log),
+            game_log: std::mem::take(&mut self.game_log),
+            ..Default::default()
+        };
+    }
+}
 
 /// Everything both worker threads need once a session token exists.
 #[derive(Clone)]
@@ -26,7 +81,7 @@ pub struct Session {
     /// round is reading it: commands written outside a round are wiped by the next
     /// handshake while the server already counts them as delivered.
     pub sync: Arc<Mutex<bool>>,
-    pub status: Arc<Mutex<String>>,
+    pub shared: Arc<Mutex<Shared>>,
 }
 
 impl Session {
@@ -34,12 +89,20 @@ impl Session {
         self.stop.load(Ordering::Relaxed)
     }
 
-    fn report(&self, text: impl Into<String>) {
-        *self.status.lock().unwrap() = text.into();
+    fn note(&self, level: Level, text: impl Into<String>) {
+        self.shared.lock().unwrap().push(level, text.into());
     }
 
     fn fail(&self, text: String) {
-        fail(&self.status, text);
+        fail(&self.shared, text);
+    }
+
+    /// Status changes from a session that was already disconnected would overwrite
+    /// the status of the next one, since a request can still be running for 10 s.
+    fn update(&self, f: impl FnOnce(&mut Shared)) {
+        if !self.stopped() {
+            f(&mut self.shared.lock().unwrap());
+        }
     }
 
     /// Sleeps in short steps so closing the window doesn't wait for a full interval.
@@ -62,7 +125,11 @@ impl Session {
     }
 
     fn set_round(&self, active: bool) {
-        *self.sync.lock().unwrap() = active;
+        let mut round = self.sync.lock().unwrap();
+        if *round != active {
+            *round = active;
+            self.update(|sh| sh.round_since = active.then(now));
+        }
     }
 
     /// Answers the game's handshake. From here on the game reads the sync file from the start.
@@ -70,6 +137,7 @@ impl Session {
         let mut active = self.sync.lock().unwrap();
         write_sync_file(&self.sync_file, &[format!("42|{text}")], true)?;
         *active = true;
+        self.update(|sh| sh.round_since = Some(now()));
         Ok(())
     }
 
@@ -138,9 +206,9 @@ pub fn log_error(message: &str) {
     }
 }
 
-pub fn fail(status: &Mutex<String>, text: String) {
+pub fn fail(shared: &Mutex<Shared>, text: String) {
     log_error(&text);
-    *status.lock().unwrap() = text;
+    shared.lock().unwrap().push(Level::Bad, text);
 }
 
 /// How a JSON value lands in a command line for the game. Mirrors what the C# adapter
@@ -164,11 +232,7 @@ fn present(v: Option<&Value>) -> Option<&Value> {
 /// file. None for unknown types and for commands missing a field the line needs;
 /// those stay unacknowledged.
 pub fn command_line(cmd: &Value) -> Option<String> {
-    let payload = match &cmd["payload"] {
-        Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
-        v @ Value::Object(_) => v.clone(),
-        _ => return None,
-    };
+    let payload = payload(cmd)?;
     let field = |key: &str| payload.get(key).map(text);
     let event_id = present(payload.get("event_game_id"))
         .or(present(payload.get("event_id")))
@@ -198,6 +262,33 @@ pub fn command_line(cmd: &Value) -> Option<String> {
         "message_revoke" => format!("312|{event_id}|{}|", field("short_message")?),
         _ => return None,
     })
+}
+
+/// AUBLst sends the payload as a JSON string; an object is taken as well.
+fn payload(cmd: &Value) -> Option<Value> {
+    match &cmd["payload"] {
+        Value::String(s) => serde_json::from_str(s).ok(),
+        v @ Value::Object(_) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// The command as a person reads it in the window's log.
+fn describe(cmd: &Value) -> String {
+    let p = payload(cmd).unwrap_or_default();
+    let f = |key: &str| p.get(key).map(text).unwrap_or_default();
+    match cmd["type"].as_str().unwrap_or_default() {
+        "assign" => match present(p.get("event_game_id")).or(present(p.get("event_id"))) {
+            Some(event) => format!("Fahrzeug {} zu Einsatz {}", f("game_vehicle_id"), text(event)),
+            None => format!("Fahrzeug {} alarmiert", f("game_vehicle_id")),
+        },
+        "unassign" => format!("Fahrzeug {} abgezogen", f("game_vehicle_id")),
+        "event_create" => format!("neuer Einsatz „{}“", f("name")),
+        "event_delete" => format!("Einsatz {} gelöscht", f("event_id")),
+        "message_create" => format!("Meldung „{}“", f("short_message")),
+        "message_revoke" => format!("Meldung „{}“ zurückgezogen", f("short_message")),
+        other => other.to_string(),
+    }
 }
 
 /// What the game reported since the last successful sync.
@@ -261,6 +352,21 @@ impl Batch {
     /// Players and time only ride along; on their own they don't trigger a sync.
     pub fn has_data(&self) -> bool {
         !(self.vehicles.is_empty() && self.hospitals.is_empty() && self.events.is_empty() && self.messages.is_empty())
+    }
+
+    /// "42 Fahrzeuge, 6 Kliniken" for the window's log.
+    fn summary(&self) -> String {
+        [
+            (self.vehicles.len(), "Fahrzeug", "Fahrzeuge"),
+            (self.hospitals.len(), "Klinik", "Kliniken"),
+            (self.events.len(), "Einsatz", "Einsätze"),
+            (self.messages.len(), "Meldung", "Meldungen"),
+        ]
+        .iter()
+        .filter(|(n, ..)| *n > 0)
+        .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 
     pub fn payload(&self, token: &str, mod_id: &str) -> Value {
@@ -407,6 +513,8 @@ pub fn run_log_monitor(s: Session) {
     // data without a new handshake) opens the sync file as well.
     let mut awaiting_handshake = false;
     let mut was_running = game_running();
+    // Only the first sync after a start or a failure goes into the window's log.
+    let mut sending = false;
     while !s.stopped() {
         let mut running = game_running();
         // The shrinking log misses a restart when the new game writes past the old
@@ -418,6 +526,7 @@ pub fn run_log_monitor(s: Session) {
                     pos = 0;
                     awaiting_handshake = true;
                     s.set_round(false);
+                    s.note(Level::Info, "Spiel beendet");
                 }
                 Err(_) => running = true, // the old process may still hold it, try again next second
             }
@@ -434,19 +543,36 @@ pub fn run_log_monitor(s: Session) {
             let rejection = match post(&s.http, &url, &payload) {
                 // Only drop what the server confirmed; anything else goes out again next round.
                 Ok(res) if res["ok"] == true => {
+                    if !sending {
+                        s.note(Level::Good, format!("Gesendet: {}", batch.summary()));
+                    }
+                    sending = true;
+                    s.update(|sh| {
+                        sh.last_sent = Some(now());
+                        sh.server_down_since = None;
+                        sh.rejecting = false;
+                    });
                     batch = Batch::default();
-                    s.report(format!("Verbunden, zuletzt gesendet {}", chrono::Local::now().format("%H:%M:%S")));
                     None
                 }
                 Ok(res) => Some(res.to_string()),
                 Err(e) if e.rejected => Some(e.message),
                 // Network trouble is no verdict on the data; keep retrying.
                 Err(e) => {
-                    s.fail(format!("Sync fehlgeschlagen: {e}"));
+                    sending = false;
+                    s.update(|sh| {
+                        sh.server_down_since.get_or_insert_with(now);
+                    });
+                    s.fail(format!("Server antwortet nicht, neuer Versuch: {e}"));
                     None
                 }
             };
             if let Some(answer) = rejection {
+                sending = false;
+                s.update(|sh| {
+                    sh.rejecting = true;
+                    sh.server_down_since = None;
+                });
                 if batch.rejected() {
                     let mut dropped = payload.to_string();
                     dropped.truncate(dropped.floor_char_boundary(4000));
@@ -469,15 +595,28 @@ fn take_lines(s: &Session, batch: &mut Batch, lines: &[String], restarted: bool,
     if restarted {
         *awaiting_handshake = true;
         s.set_round(false);
+        s.note(Level::Info, "Spiel neu gestartet, warte auf die Mod");
     }
+    s.update(|sh| {
+        for line in lines {
+            if sh.game_log.len() == LOG_LINES {
+                sh.game_log.pop_front();
+            }
+            sh.game_log.push_back(line.clone());
+        }
+    });
     for line in lines {
         if let Some(handshake) = batch.process_line(line) {
             match s.handshake(&handshake) {
-                Ok(()) => *awaiting_handshake = false,
+                Ok(()) => {
+                    *awaiting_handshake = false;
+                    s.note(Level::Good, "Mod hat die Runde gestartet");
+                }
                 Err(e) => s.fail(format!("Sync-Datei: {e}")),
             }
         } else if line.starts_with(MARKER) && !*awaiting_handshake && !s.round_active() {
             s.set_round(true);
+            s.note(Level::Good, "Mod ist in einer laufenden Runde");
         }
     }
 }
@@ -499,7 +638,7 @@ pub fn run_command_poller(s: Session) {
 /// Whether Em4.exe runs. A closed game leaves its log untouched, so the log alone can't
 /// tell that the round is over; only the next game's handshake would, and that one
 /// wipes whatever was delivered in between.
-fn game_running() -> bool {
+pub fn game_running() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -535,10 +674,23 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let url = format!("{}?action=commands_pending", s.api);
-    let res = reply(&url, s.http.get(&url).query("session_token", &s.token).call())
-        .map_err(|e| format!("Befehle abholen: {e}"))?;
+    let res = match reply(&url, s.http.get(&url).query("session_token", &s.token).call()) {
+        Ok(res) => {
+            s.update(|sh| sh.server_down_since = None);
+            res
+        }
+        Err(e) => {
+            if !e.rejected {
+                s.update(|sh| {
+                    sh.server_down_since.get_or_insert_with(now);
+                });
+            }
+            return Err(format!("Befehle abholen: {e}"));
+        }
+    };
     let mut lines = Vec::new();
     let mut ids = Vec::new();
+    let mut notes = Vec::new();
     for cmd in res["commands"].as_array().into_iter().flatten() {
         let id = text(&cmd["id"]);
         if unacked.contains(&id) {
@@ -548,8 +700,12 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
             Some(line) => {
                 lines.push(line);
                 ids.push(id);
+                notes.push(describe(cmd));
             }
-            None => log_error(&format!("Befehl nicht verstanden: {cmd}")),
+            None => {
+                log_error(&format!("Befehl nicht verstanden: {cmd}"));
+                s.note(Level::Warn, format!("Befehl nicht verstanden: {}", describe(cmd)));
+            }
         }
     }
     // Acknowledge only what reached the file; the rest comes again next poll. The round
@@ -558,18 +714,25 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
         if !s.deliver(&lines).map_err(|e| format!("Sync-Datei: {e}"))? {
             return Ok(());
         }
+        for note in notes {
+            s.note(Level::Info, format!("Ans Spiel: {note}"));
+        }
+        s.update(|sh| sh.delivered += lines.len());
         unacked.extend(ids);
     }
     if unacked.is_empty() {
         return Ok(());
     }
-    post(
+    let acked = post(
         &s.http,
         &format!("{}?action=commands_ack", s.api),
         &json!({ "session_token": s.token, "command_ids": unacked }),
-    )
-    .map_err(|e| format!("Befehle bestätigen: {e}"))?;
-    unacked.clear();
+    );
+    if acked.is_ok() {
+        unacked.clear();
+    }
+    s.update(|sh| sh.unacked = unacked.len());
+    acked.map_err(|e| format!("Server hat {} Befehle nicht bestätigt: {e}", unacked.len()))?;
     Ok(())
 }
 
@@ -721,8 +884,12 @@ mod tests {
             http: agent(),
             stop: Arc::new(AtomicBool::new(false)),
             sync: Arc::new(Mutex::new(false)),
-            status: Arc::new(Mutex::new(String::new())),
+            shared: Arc::new(Mutex::new(Shared::default())),
         }
+    }
+
+    fn log_texts(s: &Session) -> Vec<String> {
+        s.shared.lock().unwrap().log.iter().map(|e| e.text.clone()).collect()
     }
 
     /// Answers one request per (status, body) in order and returns the raw requests.
@@ -792,8 +959,12 @@ mod tests {
         let mut unacked = Vec::new();
         assert!(poll_commands(&s, &mut unacked).is_err());
         assert_eq!(unacked, ["7"]);
+        assert_eq!(s.shared.lock().unwrap().unacked, 1);
         poll_commands(&s, &mut unacked).unwrap();
         assert!(unacked.is_empty());
+        assert_eq!(s.shared.lock().unwrap().unacked, 0);
+        assert_eq!(s.shared.lock().unwrap().delivered, 1);
+        assert_eq!(log_texts(&s).iter().filter(|t| *t == "Ans Spiel: Fahrzeug 2 abgezogen").count(), 1);
         assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|1|x\r\n204|2|\r\n+\r\n");
         let requests = server.join().unwrap();
         let ack: Value = serde_json::from_str(requests[3].split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -814,7 +985,39 @@ mod tests {
         assert!(!s.round_active());
         take_lines(&s, &mut batch, &["!LSTcmd::i5|y".into()], false, &mut awaiting);
         assert!(s.round_active());
+        assert!(s.shared.lock().unwrap().round_since.is_some());
         assert_eq!(std::fs::read_to_string(&sync_file).unwrap(), "42|5|y\r\n+\r\n");
+        assert_eq!(
+            log_texts(&s),
+            ["Mod ist in einer laufenden Runde", "Spiel neu gestartet, warte auf die Mod", "Mod hat die Runde gestartet"]
+        );
+        assert_eq!(s.shared.lock().unwrap().game_log.len(), 3);
+        assert_eq!(batch.summary(), "1 Fahrzeug");
+    }
+
+    #[test]
+    fn the_window_log_skips_repeats_and_stays_bounded() {
+        let mut sh = Shared::default();
+        sh.push(Level::Bad, "Server antwortet nicht".into());
+        sh.push(Level::Bad, "Server antwortet nicht".into());
+        assert_eq!(sh.log.len(), 1);
+        for i in 0..LOG_LINES + 5 {
+            sh.push(Level::Info, i.to_string());
+        }
+        assert_eq!(sh.log.len(), LOG_LINES);
+        assert_eq!(sh.log.back().unwrap().text, (LOG_LINES + 4).to_string());
+
+        sh.delivered = 3;
+        sh.reset();
+        assert_eq!((sh.delivered, sh.log.len()), (0, LOG_LINES));
+    }
+
+    #[test]
+    fn commands_read_like_dispatch() {
+        let assign = cmd("assign", json!({ "game_vehicle_id": "83-1", "event_game_id": 17 }));
+        assert_eq!(describe(&assign), "Fahrzeug 83-1 zu Einsatz 17");
+        assert_eq!(describe(&cmd("assign", json!({ "game_vehicle_id": 4 }))), "Fahrzeug 4 alarmiert");
+        assert_eq!(describe(&cmd("event_create", json!({ "name": "Brand" }))), "neuer Einsatz „Brand“");
     }
 
     #[test]
