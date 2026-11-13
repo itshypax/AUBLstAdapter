@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adapter;
+mod theme;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
 use adapter::{Level, Session, Shared, log_error, post};
+use theme::{icon, with_icon};
 
 // Same key and value names as the C# adapter, so a switch keeps the chosen paths.
 const REG_KEY: &str = r"Software\EMLst";
@@ -22,30 +24,8 @@ const REG_STATUS_OPEN: &str = "StatusOpen";
 const REG_LOG_OPEN: &str = "LogOpen";
 const DEFAULT_GAME_DIR: &str = r"C:\Program Files\sixteentons entertainment\Emergency4";
 const DEFAULT_SYNC_FILE: &str = "input.txt";
-
-const GREEN: Color32 = Color32::from_rgb(95, 191, 106);
-const YELLOW: Color32 = Color32::from_rgb(217, 180, 74);
-const RED: Color32 = Color32::from_rgb(224, 96, 96);
-const GREY: Color32 = Color32::from_rgb(90, 90, 90);
-const BLUE: Color32 = Color32::from_rgb(0, 92, 128);
-const DARK_RED: Color32 = Color32::from_rgb(107, 38, 38);
-const BIG_BUTTON: Vec2 = vec2(150.0, 36.0);
-
-/// Codepoints in assets/Phosphor.ttf, from phosphoricons.com.
-mod icon {
-    pub const CONNECT: &str = "\u{EB5A}";
-    pub const DISCONNECT: &str = "\u{EB56}";
-    pub const COPY: &str = "\u{E1CA}";
-    pub const LINK: &str = "\u{E2E2}";
-    pub const OPEN: &str = "\u{E5DE}";
-    pub const FOLDER: &str = "\u{E256}";
-    pub const FILE: &str = "\u{E23A}";
-    pub const PLAY: &str = "\u{E3D0}";
-}
-
-fn with_icon(icon: &str, text: &str) -> String {
-    format!("{icon}  {text}")
-}
+const BIG_BUTTON: Vec2 = vec2(150.0, 40.0);
+const LOGO: &[u8] = include_bytes!("../assets/aublst.png");
 
 struct Config {
     api: String,
@@ -84,12 +64,19 @@ fn plain(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_string)
 }
 
+/// "7f3c9a1e5b2d4c86" as "7f3c 9a1e 5b2d 4c86", easier to read out and compare.
+fn grouped(code: &str) -> String {
+    code.chars().collect::<Vec<_>>().chunks(4).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
+}
+
 /// What a folder or config box shows.
 enum Pick {
     Ok,
     Missing,
     Broken(String),
 }
+
+type StatusRow = (Color32, &'static str, String);
 
 struct AdapterApp {
     pin: String,
@@ -112,10 +99,15 @@ struct AdapterApp {
     show_game_log: bool,
     follow_log: bool,
     copied: Option<(&'static str, Instant)>,
+    logo: Option<egui::TextureHandle>,
 }
 
 impl AdapterApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
+        let logo = eframe::icon_data::from_png_bytes(LOGO).ok().map(|icon| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+            ctx.load_texture("logo", image, egui::TextureOptions::LINEAR)
+        });
         let mut app = AdapterApp {
             pin: String::new(),
             token: String::new(),
@@ -140,6 +132,7 @@ impl AdapterApp {
             show_game_log: false,
             follow_log: true,
             copied: None,
+            logo,
         };
         app.check_game_dir();
         app.reload_config();
@@ -277,17 +270,89 @@ impl AdapterApp {
         }
     }
 
-    /// Shows "Kopiert" on the button for a moment instead of a separate notice.
-    fn copy_button(&mut self, ui: &mut Ui, key: &'static str, label: &str, text: String, size: Vec2, enabled: bool) {
+    /// Swaps the label for `done` for a moment instead of showing a separate notice.
+    fn copy_button(&mut self, ui: &mut Ui, key: &'static str, label: String, done: String, text: String, enabled: bool) {
         let shown = match self.copied {
-            Some((k, at)) if k == key && at.elapsed() < Duration::from_millis(1500) => with_icon(icon::COPY, "Kopiert"),
-            _ => label.to_string(),
+            Some((k, at)) if k == key && at.elapsed() < Duration::from_millis(1500) => done,
+            _ => label,
         };
-        if ui.add_enabled(enabled, egui::Button::new(shown).min_size(size)).clicked() {
+        if ui.add_enabled(enabled, egui::Button::new(shown)).on_hover_text("Kopieren").clicked() {
             ui.ctx().copy_text(text);
             self.copied = Some((key, Instant::now()));
             ui.ctx().request_repaint_after(Duration::from_millis(1600));
         }
+    }
+
+    fn status_rows(&self) -> [StatusRow; 4] {
+        let sh = self.shared.lock().unwrap();
+        let game = if self.game_running { (theme::GOOD, "Läuft") } else { (theme::OFF, "Nicht gestartet") };
+        let game = (game.0, "Spiel", game.1.to_string());
+        if self.session.is_none() {
+            return [
+                (theme::OFF, "Server", "Nicht verbunden".into()),
+                game,
+                (theme::OFF, "Mod", "Keine Runde".into()),
+                (theme::OFF, "Befehle", "Keine".into()),
+            ];
+        }
+        let server = if let Some(t) = &sh.server_down_since {
+            (theme::BAD, format!("Antwortet seit {t} nicht"))
+        } else if sh.rejecting {
+            (theme::BAD, "Lehnt die Spieldaten ab".into())
+        } else if let Some(t) = &sh.last_sent {
+            (theme::GOOD, format!("Daten zuletzt {t} gesendet"))
+        } else {
+            (theme::GOOD, "Noch keine Spieldaten".into())
+        };
+        let round = match &sh.round_since {
+            Some(t) => (theme::GOOD, format!("Seit {t} in der Runde")),
+            None => (theme::WARN, "Wartet auf den Rundenstart".into()),
+        };
+        let commands = if sh.unacked > 0 {
+            (theme::WARN, format!("{} {} auf Bestätigung", sh.unacked, if sh.unacked == 1 { "wartet" } else { "warten" }))
+        } else if sh.round_since.is_none() {
+            (theme::WARN, "Bleiben auf dem Server".into())
+        } else if sh.delivered > 0 {
+            (theme::GOOD, format!("{} ans Spiel übergeben", sh.delivered))
+        } else {
+            (theme::GOOD, "Noch keine".into())
+        };
+        [(server.0, "Server", server.1), game, (round.0, "Mod", round.1), (commands.0, "Befehle", commands.1)]
+    }
+
+    fn header(&self, ui: &mut Ui, rows: &[StatusRow; 4]) {
+        let (color, text) = if self.session.is_none() {
+            (theme::OFF, "Getrennt")
+        } else if rows.iter().any(|r| r.0 == theme::BAD) {
+            (theme::BAD, "Störung")
+        } else if rows[2].0 != theme::GOOD {
+            (theme::WARN, "Wartet aufs Spiel")
+        } else {
+            (if rows.iter().all(|r| r.0 == theme::GOOD) { theme::GOOD } else { theme::WARN }, "Verbunden")
+        };
+        ui.horizontal(|ui| {
+            if let Some(logo) = &self.logo {
+                ui.add(egui::Image::from_texture((logo.id(), vec2(32.0, 32.0))).corner_radius(5));
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("AUBLst Adapter").size(16.0).family(theme::semibold()).color(theme::STRONG));
+                ui.label(RichText::new("Emergency 4 und Leitstelle verbinden").size(11.5).color(theme::DIM));
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                egui::Frame::new()
+                    .fill(color.gamma_multiply(0.12))
+                    .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(10, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            dot(ui, color);
+                            ui.label(text);
+                        });
+                    });
+            });
+        });
     }
 
     fn connection(&mut self, ui: &mut Ui) {
@@ -295,14 +360,13 @@ impl AdapterApp {
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if connected {
-                    let label = RichText::new(with_icon(icon::DISCONNECT, "Trennen")).size(15.0);
-                    let button = egui::Button::new(label).fill(DARK_RED).min_size(BIG_BUTTON);
-                    if ui.add(button).clicked() {
+                    let label = RichText::new(with_icon(icon::DISCONNECT, "Trennen")).size(15.0).color(theme::STRONG);
+                    if ui.add(egui::Button::new(label).fill(theme::DANGER_FILL).min_size(BIG_BUTTON)).clicked() {
                         self.disconnect();
                     }
                 } else {
-                    let label = RichText::new(with_icon(icon::CONNECT, "Code anfordern")).size(15.0);
-                    let button = egui::Button::new(label).fill(BLUE).min_size(BIG_BUTTON);
+                    let label = RichText::new(with_icon(icon::CONNECT, "Code anfordern")).size(15.0).color(theme::STRONG);
+                    let button = egui::Button::new(label).fill(theme::ACCENT).min_size(BIG_BUTTON);
                     let hover = "Für einen Code braucht es Spielordner und Config.";
                     if ui.add_enabled(self.ready(), button).on_disabled_hover_text(hover).clicked() {
                         self.request_token();
@@ -311,29 +375,38 @@ impl AdapterApp {
                 ui.add_enabled(
                     !connected,
                     egui::TextEdit::singleline(&mut self.pin)
-                        .hint_text(if connected { "Keine PIN" } else { "PIN (optional)" })
-                        .font(egui::FontId::monospace(18.0))
+                        .hint_text(
+                            RichText::new(if connected { "Keine PIN" } else { "PIN (optional)" }).size(17.0).color(theme::HINT),
+                        )
+                        .font(egui::FontId::proportional(17.0))
                         .char_limit(10)
-                        .margin(Margin::symmetric(10, 8))
+                        .margin(Margin::symmetric(10, 9))
                         .desired_width(f32::INFINITY),
                 );
             });
         });
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let token = self.token.clone();
-                self.copy_button(ui, "code", &with_icon(icon::COPY, "Kopieren"), token, BIG_BUTTON, connected);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.token.as_str())
-                        .hint_text("Noch kein Code")
-                        .background_color(ui.visuals().extreme_bg_color)
-                        .font(egui::FontId::monospace(18.0))
-                        .text_color(GREEN)
-                        .margin(Margin::symmetric(10, 8))
-                        .desired_width(f32::INFINITY),
-                );
+
+        egui::Frame::new()
+            .fill(theme::FIELD)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(4)
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.set_min_height(28.0);
+                    if connected {
+                        ui.label(RichText::new(grouped(&self.token)).monospace().size(19.0).color(theme::GOOD));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let token = self.token.clone();
+                            self.copy_button(ui, "code", icon::COPY.into(), icon::CHECK.into(), token, true);
+                        });
+                    } else {
+                        ui.label(RichText::new("Noch kein Code").size(17.0).color(theme::HINT));
+                    }
+                });
             });
-        });
+
         if let Some(url) = self.dispatch_url().filter(|_| connected) {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -342,21 +415,24 @@ impl AdapterApp {
                     {
                         self.fail(format!("Browser öffnen fehlgeschlagen: {e}"));
                     }
-                    self.copy_button(ui, "link", &with_icon(icon::LINK, "Link kopieren"), url.clone(), Vec2::ZERO, true);
-                    let color = ui.visuals().hyperlink_color;
-                    ui.add(egui::Label::new(RichText::new(&url).color(color)).truncate()).on_hover_text(&url);
+                    let (label, done) = (with_icon(icon::LINK, "Link kopieren"), with_icon(icon::CHECK, "Kopiert"));
+                    self.copy_button(ui, "link", label, done, url.clone(), true);
+                    ui.add(egui::Label::new(RichText::new(&url).color(theme::LINK)).truncate()).on_hover_text(&url);
                 });
             });
         }
     }
 
-    /// A folder or config box: yellow while nothing is chosen, red when the choice is unusable.
-    fn pick_box(ui: &mut Ui, title: &str, icon: &str, path: &str, state: &Pick, enabled: bool) -> bool {
-        let (stroke, fill, value, color) = match state {
-            Pick::Ok => (Color32::from_rgb(51, 51, 51), Color32::from_rgb(34, 34, 34), path.to_string(), Color32::from_rgb(240, 240, 240)),
-            Pick::Missing => (YELLOW, Color32::from_rgb(42, 37, 22), "Nicht gewählt".to_string(), YELLOW),
-            Pick::Broken(e) => (RED, Color32::from_rgb(42, 25, 25), e.clone(), RED),
+    /// A folder or config box: name large, full path below. Yellow while nothing is
+    /// chosen, red when the choice is unusable.
+    fn pick_box(ui: &mut Ui, title: &str, icons: (&str, &str), path: &str, state: &Pick, enabled: bool) -> bool {
+        let name = Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+        let (accent, fill, big, small) = match state {
+            Pick::Ok => (theme::DIM, theme::BOX, (name, theme::STRONG), Some((path.to_string(), theme::DIM))),
+            Pick::Missing => (theme::WARN, theme::WARN_BG, (format!("{title} nicht gewählt"), theme::WARN), None),
+            Pick::Broken(e) => (theme::BAD, theme::BAD_BG, (name, theme::STRONG), Some((e.clone(), theme::BAD))),
         };
+        let stroke = if matches!(state, Pick::Ok) { theme::BORDER } else { accent };
         let mut clicked = false;
         egui::Frame::new()
             .fill(fill)
@@ -365,16 +441,20 @@ impl AdapterApp {
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label(RichText::new(icons.0).size(20.0).color(accent));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut button = egui::Button::new(with_icon(icon, "Wählen"));
+                        let mut button = egui::Button::new(with_icon(icons.1, "Wählen"));
                         if !matches!(state, Pick::Ok) {
-                            button = button.fill(Color32::from_rgb(138, 109, 30));
+                            button = button.fill(theme::WARN_FILL);
                         }
                         clicked = ui.add_enabled(enabled, button).on_disabled_hover_text("Erst trennen").clicked();
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(RichText::new(title).small().weak());
-                            ui.add(egui::Label::new(RichText::new(value).color(color)).truncate()).on_hover_text(path);
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add(egui::Label::new(RichText::new(big.0).size(14.5).color(big.1)).truncate())
+                                .on_hover_text(path);
+                            if let Some((text, color)) = small {
+                                ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).truncate());
+                            }
                         });
                     });
                 });
@@ -384,7 +464,8 @@ impl AdapterApp {
 
     fn paths(&mut self, ui: &mut Ui) {
         let connected = self.session.is_some();
-        if Self::pick_box(ui, "Spielordner", icon::FOLDER, &self.game_dir, &self.game_dir_state, !connected)
+        let folder = (icon::FOLDER, icon::FOLDER);
+        if Self::pick_box(ui, "Spielordner", folder, &self.game_dir, &self.game_dir_state, !connected)
             && let Some(dir) = rfd::FileDialog::new().set_directory(&self.game_dir).pick_folder()
         {
             self.game_dir = dir.display().to_string();
@@ -392,7 +473,7 @@ impl AdapterApp {
             self.check_game_dir();
         }
         let shown = adapter::beside_exe(&self.config_path).display().to_string();
-        if Self::pick_box(ui, "Config", icon::FILE, &shown, &self.config_state, !connected)
+        if Self::pick_box(ui, "Config", (icon::FILE, icon::FILE), &shown, &self.config_state, !connected)
             && let Some(file) = rfd::FileDialog::new().add_filter("Config", &["cfg"]).pick_file()
         {
             self.config_path = file.display().to_string();
@@ -407,7 +488,7 @@ impl AdapterApp {
             } else {
                 ""
             };
-            ui.label(RichText::new(note).weak());
+            ui.label(RichText::new(note).color(theme::DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let can_start = matches!(self.game_dir_state, Pick::Ok) && self.config.is_some() && !self.game_running;
                 let hover = if self.game_running { "Em4.exe läuft schon" } else { "Erst Spielordner und Config wählen" };
@@ -419,51 +500,15 @@ impl AdapterApp {
         });
     }
 
-    fn status_rows(&self, sh: &Shared) -> [(Color32, &'static str, String); 4] {
-        let game = if self.game_running { (GREEN, "Läuft") } else { (GREY, "Nicht gestartet") };
-        let game = (game.0, "Spiel", game.1.to_string());
-        if self.session.is_none() {
-            return [
-                (GREY, "Server", "Nicht verbunden".into()),
-                game,
-                (GREY, "Mod", "Keine Runde".into()),
-                (GREY, "Befehle", "Keine".into()),
-            ];
-        }
-        let server = if let Some(t) = &sh.server_down_since {
-            (RED, format!("Antwortet seit {t} nicht"))
-        } else if sh.rejecting {
-            (RED, "Lehnt die Spieldaten ab".into())
-        } else if let Some(t) = &sh.last_sent {
-            (GREEN, format!("Daten zuletzt {t} gesendet"))
-        } else {
-            (GREEN, "Verbunden, noch keine Spieldaten".into())
-        };
-        let round = match &sh.round_since {
-            Some(t) => (GREEN, format!("Seit {t} in der Runde")),
-            None => (YELLOW, "Wartet auf den Rundenstart".into()),
-        };
-        let commands = if sh.unacked > 0 {
-            (YELLOW, format!("{} {} auf Bestätigung", sh.unacked, if sh.unacked == 1 { "wartet" } else { "warten" }))
-        } else if sh.round_since.is_none() {
-            (YELLOW, "Bleiben auf dem Server".into())
-        } else if sh.delivered > 0 {
-            (GREEN, format!("{} ans Spiel übergeben", sh.delivered))
-        } else {
-            (GREEN, "Noch keine".into())
-        };
-        [(server.0, "Server", server.1), game, (round.0, "Mod", round.1), (commands.0, "Befehle", commands.1)]
-    }
-
-    fn status(&mut self, ui: &mut Ui) {
-        let rows = self.status_rows(&self.shared.lock().unwrap());
+    fn status(&mut self, ui: &mut Ui, rows: &[StatusRow; 4]) {
         let (color, summary) = if self.session.is_none() {
-            (GREY, "Nicht verbunden".to_string())
-        } else if let Some((_, k, v)) = rows.iter().find(|r| r.0 == RED) {
-            (RED, format!("{k}: {v}"))
+            (theme::OFF, "Nicht verbunden".to_string())
+        } else if let Some((_, k, v)) = rows.iter().find(|r| r.0 == theme::BAD) {
+            (theme::BAD, format!("{k}: {v}"))
         } else {
-            let open: Vec<String> = rows.iter().filter(|r| r.0 != GREEN).map(|(_, k, v)| format!("{k}: {v}")).collect();
-            if open.is_empty() { (GREEN, "Alles läuft".to_string()) } else { (YELLOW, open.join(", ")) }
+            let open: Vec<String> =
+                rows.iter().filter(|r| r.0 != theme::GOOD).map(|(_, k, v)| format!("{k}: {v}")).collect();
+            if open.is_empty() { (theme::GOOD, "Alles läuft".to_string()) } else { (theme::WARN, open.join(", ")) }
         };
         let toggled = fold_header(ui, self.status_open, |ui| {
             dot(ui, color);
@@ -474,45 +519,55 @@ impl AdapterApp {
             write_setting(REG_STATUS_OPEN, if self.status_open { "1" } else { "0" });
         }
         if self.status_open {
-            ui.indent("status", |ui| {
-                egui::Grid::new("status_rows").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-                    for (color, key, value) in &rows {
-                        ui.label(RichText::new(*key).weak());
-                        ui.horizontal(|ui| {
-                            dot(ui, *color);
-                            ui.label(value);
-                        });
-                        ui.end_row();
+            // Fixed columns: a frame only knows its width after drawing, so a wrapping row can't break before it.
+            for pair in rows.chunks(2) {
+                ui.columns(2, |cols| {
+                    for (ui, (color, key, value)) in cols.iter_mut().zip(pair) {
+                        egui::Frame::new()
+                            .stroke(Stroke::new(1.0, theme::BORDER))
+                            .corner_radius(12)
+                            .inner_margin(Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    dot(ui, *color);
+                                    ui.label(RichText::new(*key).color(theme::DIM));
+                                    ui.add(egui::Label::new(value).truncate()).on_hover_text(value);
+                                });
+                            });
                     }
                 });
-            });
+            }
         }
     }
 
     fn log(&mut self, ui: &mut Ui) {
-        let text_color = ui.visuals().text_color();
-        let weak = ui.visuals().weak_text_color();
-        let level_color = |level: Level| match level {
-            Level::Info => text_color,
-            Level::Good => GREEN,
-            Level::Warn => YELLOW,
-            Level::Bad => RED,
+        let style = |level: Level| match level {
+            Level::Info => (icon::INFO, theme::TEXT),
+            Level::Good => (icon::GOOD, theme::GOOD),
+            Level::Warn => (icon::WARN, theme::WARN),
+            Level::Bad => (icon::BAD, theme::BAD),
         };
+        // (shown, colour, copied)
         let (last, lines) = {
             let sh = self.shared.lock().unwrap();
-            let last = sh.log.back().map(|e| (format!("{} {}", e.time, e.text), level_color(e.level)));
-            let lines: Vec<(String, Color32)> = if !self.log_open {
+            let entry = |e: &adapter::Entry| {
+                let (icon, color) = style(e.level);
+                (format!("{}  {icon}  {}", e.time, e.text), color, format!("{} {}", e.time, e.text))
+            };
+            let last = sh.log.back().map(entry);
+            let lines: Vec<(String, Color32, String)> = if !self.log_open {
                 Vec::new()
             } else if self.show_game_log {
-                sh.game_log.iter().map(|l| (l.clone(), weak)).collect()
+                sh.game_log.iter().map(|l| (l.clone(), theme::DIM, l.clone())).collect()
             } else {
-                sh.log.iter().map(|e| (format!("{} {}", e.time, e.text), level_color(e.level))).collect()
+                sh.log.iter().map(entry).collect()
             };
             (last, lines)
         };
 
         let toggled = fold_header(ui, self.log_open, |ui| {
-            let (text, color) = last.unwrap_or_else(|| ("Noch keine Einträge".into(), weak));
+            let (text, color) = last.map_or(("Noch keine Einträge".into(), theme::DIM), |(t, c, _)| (t, c));
             ui.add(egui::Label::new(RichText::new(text).color(color)).truncate().selectable(false));
         });
         if toggled {
@@ -526,27 +581,45 @@ impl AdapterApp {
             ui.selectable_value(&mut self.show_game_log, false, "Adapter");
             ui.selectable_value(&mut self.show_game_log, true, "Spiel-Log");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let all = lines.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\r\n");
-                self.copy_button(ui, "log", &with_icon(icon::COPY, "Kopieren"), all, Vec2::ZERO, !lines.is_empty());
+                let all = lines.iter().map(|(_, _, plain)| plain.as_str()).collect::<Vec<_>>().join("\r\n");
+                let (label, done) = (with_icon(icon::COPY, "Kopieren"), with_icon(icon::CHECK, "Kopiert"));
+                self.copy_button(ui, "log", label, done, all, !lines.is_empty());
                 ui.checkbox(&mut self.follow_log, "Mitscrollen");
             });
         });
-        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+        let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 3.0;
         egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
-            .corner_radius(3)
-            .inner_margin(Margin::same(6))
+            .fill(theme::FIELD)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(4)
+            .inner_margin(Margin::same(8))
             .show(ui, |ui| {
                 egui::ScrollArea::both()
                     .auto_shrink(false)
                     .stick_to_bottom(self.follow_log)
                     .show_rows(ui, row_height, lines.len(), |ui, range| {
-                        for (text, color) in &lines[range] {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        for (text, color, _) in &lines[range] {
                             ui.add(egui::Label::new(RichText::new(text).monospace().color(*color)).extend());
                         }
                     });
             });
     }
+}
+
+/// A section of the window: a card with a small heading.
+fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(8)
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(RichText::new(title.to_uppercase()).size(11.0).family(theme::semibold()).color(theme::DIM));
+            add(ui);
+        });
 }
 
 /// A quiet header line that opens and closes the section below it. True when clicked.
@@ -561,7 +634,7 @@ fn fold_header(ui: &mut Ui, open: bool, add: impl FnOnce(&mut Ui)) -> bool {
 
 fn dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 3.5, color);
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 impl eframe::App for AdapterApp {
@@ -572,14 +645,18 @@ impl eframe::App for AdapterApp {
             self.game_running = adapter::game_running();
             self.game_checked = Some(Instant::now());
         }
-        egui::CentralPanel::default().show(ui, |ui| {
+        let rows = self.status_rows();
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(12))).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
-            self.connection(ui);
-            self.paths(ui);
-            ui.separator();
-            self.status(ui);
-            ui.separator();
-            self.log(ui);
+            ui.spacing_mut().button_padding = vec2(10.0, 5.0);
+            self.header(ui, &rows);
+            card(ui, "Verbindung", |ui| self.connection(ui));
+            card(ui, "Spiel", |ui| self.paths(ui));
+            card(ui, "Status und Log", |ui| {
+                self.status(ui, &rows);
+                ui.separator();
+                self.log(ui);
+            });
         });
     }
 }
@@ -597,9 +674,9 @@ impl Drop for AdapterApp {
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("AUBLst Adapter")
-        .with_inner_size([500.0, 640.0])
-        .with_min_inner_size([440.0, 360.0]);
-    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/aublst.png")) {
+        .with_inner_size([520.0, 760.0])
+        .with_min_inner_size([460.0, 520.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(LOGO) {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
@@ -607,18 +684,10 @@ fn main() -> eframe::Result {
         "AUBLst Adapter",
         options,
         Box::new(|cc| {
-            // The boxes and log colours are made for the dark look.
             cc.egui_ctx.set_theme(egui::Theme::Dark);
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("phosphor".into(), egui::FontData::from_static(include_bytes!("../assets/Phosphor.ttf")).into());
-            // As a fallback after the text font, so icons mix into ordinary labels.
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                family.push("phosphor".into());
-            }
-            cc.egui_ctx.set_fonts(fonts);
-            Ok(Box::new(AdapterApp::new()))
+            cc.egui_ctx.set_visuals_of(egui::Theme::Dark, theme::visuals());
+            cc.egui_ctx.set_fonts(theme::fonts());
+            Ok(Box::new(AdapterApp::new(&cc.egui_ctx)))
         }),
     )
 }
