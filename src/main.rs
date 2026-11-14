@@ -76,7 +76,8 @@ enum Pick {
     Broken(String),
 }
 
-type StatusRow = (Color32, &'static str, String);
+/// (colour, name, detail, what the folded status says when this row is the problem)
+type StatusRow = (Color32, &'static str, String, &'static str);
 
 struct AdapterApp {
     pin: String,
@@ -288,38 +289,44 @@ impl AdapterApp {
     fn status_rows(&self) -> [StatusRow; 4] {
         let sh = self.shared.lock().unwrap();
         let game = if self.game_running { (theme::GOOD, "Läuft") } else { (theme::OFF, "Nicht gestartet") };
-        let game = (game.0, "Spiel", game.1.to_string());
+        let game = (game.0, "Spiel", game.1.to_string(), "Spiel nicht gestartet");
         if self.session.is_none() {
             return [
-                (theme::OFF, "Server", "Nicht verbunden".into()),
+                (theme::OFF, "Server", "Nicht verbunden".into(), "Nicht verbunden"),
                 game,
-                (theme::OFF, "Mod", "Keine Runde".into()),
-                (theme::OFF, "Befehle", "Keine".into()),
+                (theme::OFF, "Mod", "Keine Runde".into(), ""),
+                (theme::OFF, "Befehle", "Keine".into(), ""),
             ];
         }
         let server = if let Some(t) = &sh.server_down_since {
-            (theme::BAD, format!("Antwortet seit {t} nicht"))
+            (theme::BAD, format!("Antwortet seit {t} nicht"), "Server antwortet nicht")
         } else if sh.rejecting {
-            (theme::BAD, "Lehnt die Spieldaten ab".into())
+            (theme::BAD, "Lehnt die Spieldaten ab".into(), "Server lehnt Daten ab")
         } else if let Some(t) = &sh.last_sent {
-            (theme::GOOD, format!("Daten zuletzt {t} gesendet"))
+            (theme::GOOD, format!("Daten zuletzt {t} gesendet"), "")
         } else {
-            (theme::GOOD, "Noch keine Spieldaten".into())
+            (theme::GOOD, "Noch keine Spieldaten".into(), "")
         };
         let round = match &sh.round_since {
-            Some(t) => (theme::GOOD, format!("Seit {t} in der Runde")),
-            None => (theme::WARN, "Wartet auf den Rundenstart".into()),
+            Some(t) => (theme::GOOD, format!("Seit {t} in der Runde"), ""),
+            None => (theme::WARN, "Wartet auf den Rundenstart".into(), "Wartet auf die Mod"),
         };
         let commands = if sh.unacked > 0 {
-            (theme::WARN, format!("{} {} auf Bestätigung", sh.unacked, if sh.unacked == 1 { "wartet" } else { "warten" }))
+            let verb = if sh.unacked == 1 { "wartet" } else { "warten" };
+            (theme::WARN, format!("{} {verb} auf Bestätigung", sh.unacked), "Befehle unbestätigt")
         } else if sh.round_since.is_none() {
-            (theme::WARN, "Bleiben auf dem Server".into())
+            (theme::WARN, "Bleiben auf dem Server".into(), "Befehle warten")
         } else if sh.delivered > 0 {
-            (theme::GOOD, format!("{} ans Spiel übergeben", sh.delivered))
+            (theme::GOOD, format!("{} ans Spiel übergeben", sh.delivered), "")
         } else {
-            (theme::GOOD, "Noch keine".into())
+            (theme::GOOD, "Noch keine".into(), "")
         };
-        [(server.0, "Server", server.1), game, (round.0, "Mod", round.1), (commands.0, "Befehle", commands.1)]
+        [
+            (server.0, "Server", server.1, server.2),
+            game,
+            (round.0, "Mod", round.1, round.2),
+            (commands.0, "Befehle", commands.1, commands.2),
+        ]
     }
 
     fn header(&self, ui: &mut Ui, rows: &[StatusRow; 4]) {
@@ -503,14 +510,12 @@ impl AdapterApp {
     }
 
     fn status(&mut self, ui: &mut Ui, rows: &[StatusRow; 4]) {
-        let (color, summary) = if self.session.is_none() {
-            (theme::OFF, "Nicht verbunden".to_string())
-        } else if let Some((_, k, v)) = rows.iter().find(|r| r.0 == theme::BAD) {
-            (theme::BAD, format!("{k}: {v}"))
-        } else {
-            let open: Vec<String> =
-                rows.iter().filter(|r| r.0 != theme::GOOD).map(|(_, k, v)| format!("{k}: {v}")).collect();
-            if open.is_empty() { (theme::GOOD, "Alles läuft".to_string()) } else { (theme::WARN, open.join(", ")) }
+        // Folded, only the most pressing problem in a few words; the details are one click away.
+        let worst = rows.iter().find(|r| r.0 == theme::BAD).or_else(|| rows.iter().find(|r| r.0 != theme::GOOD));
+        let (color, summary) = match worst {
+            _ if self.session.is_none() => (theme::OFF, "Nicht verbunden"),
+            Some(&(color, _, _, short)) => (if color == theme::BAD { theme::BAD } else { theme::WARN }, short),
+            None => (theme::GOOD, "Alles läuft"),
         };
         let toggled = fold_header(ui, self.status_open, |ui| {
             dot(ui, color);
@@ -524,7 +529,7 @@ impl AdapterApp {
             // Fixed columns: a frame only knows its width after drawing, so a wrapping row can't break before it.
             for pair in rows.chunks(2) {
                 ui.columns(2, |cols| {
-                    for (ui, (color, key, value)) in cols.iter_mut().zip(pair) {
+                    for (ui, (color, key, value, _)) in cols.iter_mut().zip(pair) {
                         egui::Frame::new()
                             .stroke(Stroke::new(1.0, theme::BORDER))
                             .corner_radius(12)
