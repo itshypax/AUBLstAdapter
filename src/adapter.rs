@@ -621,17 +621,22 @@ fn take_lines(s: &Session, batch: &mut Batch, lines: &[String], restarted: bool,
     }
 }
 
-/// Fetches pending commands every five seconds and hands them to the game.
+/// Fetches pending commands every second and hands them to the game. After a failed
+/// request it waits five, so a server in trouble isn't asked every second.
 pub fn run_command_poller(s: Session) {
     let mut unacked = Vec::new();
     while !s.stopped() {
         if !game_running() {
             s.set_round(false);
         }
-        if let Err(e) = poll_commands(&s, &mut unacked) {
-            s.fail(e);
-        }
-        s.pause(Duration::from_secs(5));
+        let wait = match poll_commands(&s, &mut unacked) {
+            Ok(()) => 1,
+            Err(e) => {
+                s.fail(e);
+                5
+            }
+        };
+        s.pause(Duration::from_secs(wait));
     }
 }
 

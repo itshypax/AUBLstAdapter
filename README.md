@@ -21,7 +21,7 @@ Spielordner und Config wählen (beides merkt sich der Adapter), optional eine PI
 
 Unter den Einstellungen stehen Status und Log, beide einklappbar. Zugeklappt zeigt der Status nur, ob alles läuft oder was fehlt, und das Log nur seinen letzten Eintrag. Aufgeklappt gibt es das Adapter-Log und die rohen Zeilen aus der `logfile.txt` des Spiels.
 
-Befehle der Leitstelle holt der Adapter nur ab, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
+Befehle der Leitstelle holt der Adapter jede Sekunde ab, aber nur, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Antwortet der Server nicht, fragt er nur noch alle fünf Sekunden. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
 
 Fehler stehen im Log des Fensters und in `error.log` neben der Exe.
 
