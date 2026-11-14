@@ -22,10 +22,99 @@ pub enum Level {
     Bad,
 }
 
+impl Level {
+    fn wire(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Good => "good",
+            Level::Warn => "warn",
+            Level::Bad => "bad",
+        }
+    }
+}
+
 pub struct Entry {
     pub time: String,
     pub level: Level,
     pub text: String,
+}
+
+/// Entries waiting for `adapter_log`. A server that stays down must not grow it without end.
+const OUTBOX_LIMIT: usize = 500;
+/// The server takes at most this many entries per request.
+const OUTBOX_BATCH: usize = 50;
+
+/// What a log line may carry off this machine: the user profile becomes "~" (it holds
+/// the Windows account name) and IPv4 addresses become "<IP>".
+pub fn scrub(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Ok(profile) = std::env::var("USERPROFILE")
+        && !profile.is_empty()
+    {
+        out = replace_ignore_ascii_case(&out, &profile, "~");
+    }
+    // Profiles of other accounts, and paths written with forward slashes.
+    for sep in ['\\', '/'] {
+        let needle = format!(":{sep}users{sep}");
+        while let Some(at) = out.to_ascii_lowercase().find(&needle) {
+            let start = if at > 0 && out.as_bytes()[at - 1].is_ascii_alphabetic() { at - 1 } else { at };
+            let name_start = at + needle.len();
+            let end = out[name_start..].find(['\\', '/', '"']).map_or(out.len(), |i| name_start + i);
+            out.replace_range(start..end, "~");
+        }
+    }
+    scrub_ipv4(&out)
+}
+
+fn replace_ignore_ascii_case(text: &str, from: &str, to: &str) -> String {
+    let (lower, from) = (text.to_ascii_lowercase(), from.to_ascii_lowercase());
+    let mut out = String::new();
+    let mut rest = 0;
+    for (at, _) in lower.match_indices(&from) {
+        out.push_str(&text[rest..at]);
+        out.push_str(to);
+        rest = at + from.len();
+    }
+    out.push_str(&text[rest..]);
+    out
+}
+
+fn scrub_ipv4(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let boundary = i == 0 || !(bytes[i - 1].is_ascii_digit() || bytes[i - 1] == b'.');
+        if boundary && let Some(len) = ipv4_len(&bytes[i..]) {
+            out.push_str("<IP>");
+            i += len;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Length of four dot-separated groups of 1 to 3 digits at the start, if that is what's there.
+fn ipv4_len(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    for group in 0..4 {
+        let digits = b[i..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=3).contains(&digits) {
+            return None;
+        }
+        i += digits;
+        if group < 3 {
+            if b.get(i) != Some(&b'.') {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    // "1.2.3.4.5" is no address
+    (!(b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(u8::is_ascii_digit))).then_some(i)
 }
 
 pub fn now() -> String {
@@ -43,6 +132,9 @@ pub struct Shared {
     pub round_since: Option<String>,
     pub delivered: usize,
     pub unacked: usize,
+    /// The window log as it goes to the server, already scrubbed. Emptied by `reset`,
+    /// so nothing from before the session reaches it.
+    pub outbox: VecDeque<Value>,
 }
 
 impl Shared {
@@ -54,6 +146,14 @@ impl Shared {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
         }
+        if self.outbox.len() == OUTBOX_LIMIT {
+            self.outbox.pop_front();
+        }
+        self.outbox.push_back(json!({
+            "time": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            "level": level.wire(),
+            "text": scrub(&text),
+        }));
         self.log.push_back(Entry { time: now(), level, text });
     }
 
@@ -576,9 +676,10 @@ pub fn run_log_monitor(s: Session) {
                 if batch.rejected() {
                     let mut dropped = payload.to_string();
                     dropped.truncate(dropped.floor_char_boundary(4000));
-                    s.fail(format!(
-                        "Sync {MAX_REJECTIONS}-mal abgelehnt, Daten verworfen. Antwort: {answer}. Daten: {dropped}"
-                    ));
+                    // The data holds player names and raw game reports, so it stays on this machine.
+                    let text = format!("Sync {MAX_REJECTIONS}-mal abgelehnt, Daten verworfen. Antwort: {answer}");
+                    log_error(&format!("{text}. Daten: {dropped}"));
+                    s.note(Level::Bad, format!("{text}. Die Daten stehen im error.log."));
                     batch = Batch::default();
                 } else {
                     s.fail(format!("Sync abgelehnt: {answer}"));
@@ -637,6 +738,44 @@ pub fn run_command_poller(s: Session) {
             }
         };
         s.pause(Duration::from_secs(wait));
+    }
+}
+
+/// Sends the window log to the server every five seconds, for the operator's view.
+pub fn run_log_uploader(s: Session) {
+    while !s.stopped() {
+        s.pause(Duration::from_secs(5));
+        send_log(&s);
+    }
+}
+
+/// Never writes to the window log itself: a failure would queue another entry to send.
+/// Entries stay queued while the server is unreachable; a server that refuses them
+/// (an AUBLst without `adapter_log`) won't take them later either, so they are dropped.
+fn send_log(s: &Session) {
+    let url = format!("{}?action=adapter_log", s.api);
+    loop {
+        let chunk: Vec<Value> = {
+            let mut sh = s.shared.lock().unwrap();
+            let n = sh.outbox.len().min(OUTBOX_BATCH);
+            sh.outbox.drain(..n).collect()
+        };
+        if chunk.is_empty() || s.stopped() {
+            return;
+        }
+        match post(&s.http, &url, &json!({ "session_token": s.token, "entries": chunk })) {
+            Ok(_) => {}
+            Err(e) if e.rejected => log_error(&format!("Log senden abgelehnt: {e}")),
+            Err(_) => {
+                s.update(|sh| {
+                    for entry in chunk.into_iter().rev() {
+                        sh.outbox.push_front(entry);
+                    }
+                    sh.outbox.truncate(OUTBOX_LIMIT);
+                });
+                return;
+            }
+        }
     }
 }
 
@@ -1015,6 +1154,52 @@ mod tests {
         sh.delivered = 3;
         sh.reset();
         assert_eq!((sh.delivered, sh.log.len()), (0, LOG_LINES));
+    }
+
+    #[test]
+    fn log_leaves_the_machine_without_profile_paths_or_addresses() {
+        let profile = std::env::var("USERPROFILE").unwrap();
+        assert_eq!(scrub(&format!("Logdatei {profile}\\Spiele\\logfile.txt fehlt")), "Logdatei ~\\Spiele\\logfile.txt fehlt");
+        assert_eq!(
+            scrub(r#"Sync-Datei D:\USERS\Max Muster\Em4\input.txt und "c:/Users/anna" gesperrt"#),
+            r#"Sync-Datei ~\Em4\input.txt und "~" gesperrt"#
+        );
+        assert_eq!(scrub("ä:\\Users\\x"), "ä~");
+        assert_eq!(
+            scrub("http://192.168.0.12:8080/api.php: Verbindung zu 10.0.0.1 fehlgeschlagen"),
+            "http://<IP>:8080/api.php: Verbindung zu <IP> fehlgeschlagen"
+        );
+        assert_eq!(scrub("Version 1.2.3.4.5, 1234.1.1.1, 3 Fahrzeuge"), "Version 1.2.3.4.5, 1234.1.1.1, 3 Fahrzeuge");
+    }
+
+    #[test]
+    fn the_window_log_is_sent_and_kept_while_the_server_is_down() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let s = session(&temp("upload.txt"), &format!("http://{closed}/api.php"));
+        for i in 0..OUTBOX_BATCH + 3 {
+            s.note(Level::Warn, format!("Eintrag {i}"));
+        }
+        send_log(&s);
+        assert_eq!(s.shared.lock().unwrap().outbox.len(), OUTBOX_BATCH + 3);
+
+        let (url, server) = serve(vec![("200 OK", r#"{"ok":true}"#), ("400 Bad Request", r#"{"error":"Unknown action"}"#)]);
+        let s = Session { api: url, ..s };
+        send_log(&s);
+        assert!(s.shared.lock().unwrap().outbox.is_empty(), "a refused batch is dropped as well");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /api.php?action=adapter_log "));
+        let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["session_token"], "tok");
+        assert_eq!(body["entries"].as_array().unwrap().len(), OUTBOX_BATCH);
+        assert_eq!((body["entries"][0]["level"].as_str(), body["entries"][0]["text"].as_str()), (Some("warn"), Some("Eintrag 0")));
+
+        let mut sh = Shared::default();
+        for i in 0..OUTBOX_LIMIT + 1 {
+            sh.push(Level::Info, i.to_string());
+        }
+        assert_eq!(sh.outbox.len(), OUTBOX_LIMIT);
+        sh.reset();
+        assert!(sh.outbox.is_empty(), "nothing from before a session goes out");
     }
 
     #[test]

@@ -25,6 +25,8 @@ Befehle der Leitstelle holt der Adapter jede Sekunde ab, aber nur, solange `Em4.
 
 Fehler stehen im Log des Fensters und in `error.log` neben der Exe.
 
+Solange eine Sitzung läuft, schickt der Adapter das Log des Fensters alle fünf Sekunden an den Server (`adapter_log`). Der Betreiber kann es dort 24 Stunden lang in der Betreiberansicht nachlesen. Vorher ersetzt der Adapter das Benutzerprofil in Pfaden (etwa `C:\Users\Name`) durch `~` und IP-Adressen durch `<IP>`. PIN, Spielernamen und die Zeilen aus der `logfile.txt` gehen nicht mit, abgelehnte Spieldaten stehen nur im `error.log`. Ist der Server nicht erreichbar, hält der Adapter bis zu 500 Einträge zurück und versucht es später noch einmal.
+
 Wer bisher den C#-Adapter benutzt hat, muss nichts neu einstellen: Spielordner und Config liegen unter demselben Registry-Schlüssel (`HKCU\Software\EMLst`).
 
 ## Entwickeln

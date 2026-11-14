@@ -240,6 +240,8 @@ impl AdapterApp {
         std::thread::spawn(move || adapter::run_log_monitor(log_session));
         let command_session = session.clone();
         std::thread::spawn(move || adapter::run_command_poller(command_session));
+        let log_upload_session = session.clone();
+        std::thread::spawn(move || adapter::run_log_uploader(log_upload_session));
         self.session = Some(session);
     }
 
