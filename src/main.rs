@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, Stroke, Ui, Vec2, vec2};
-use serde_json::{Value, json};
+use serde_json::Value;
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-use adapter::{Level, Session, Shared, log_error, post};
+use adapter::{Api, Level, Session, Shared, log_error};
 use theme::{icon, with_icon};
 
 // Same key and value names as the C# adapter, so a switch keeps the chosen paths.
@@ -243,12 +243,12 @@ impl AdapterApp {
         if !self.pin.is_empty() {
             body["pin"] = Value::String(self.pin.clone());
         }
-        let url = format!("{}?action=session_create", config.api);
-        match post(&self.http, &url, &body) {
+        let api = Api::detect(&self.http, &config.api);
+        match api.call(&self.http, "session_create", "", Some(&body)) {
             Ok(res) => match res["session_token"].as_str() {
                 Some(token) => {
                     self.token = token.to_string();
-                    self.start();
+                    self.start(api);
                 }
                 None => self.fail(format!("Kein Code erhalten: {res}")),
             },
@@ -256,14 +256,14 @@ impl AdapterApp {
         }
     }
 
-    fn start(&mut self) {
+    fn start(&mut self, api: Api) {
         let Some(config) = &self.config else { return };
         self.shared.lock().unwrap().reset();
         *self.sync.lock().unwrap() = false;
         let game_dir = PathBuf::from(&self.game_dir);
         let sync_name = config.raw["sync_path"].as_str().unwrap_or(DEFAULT_SYNC_FILE);
         let session = Session {
-            api: config.api.clone(),
+            api,
             sync_file: game_dir.join(sync_name),
             game_dir,
             token: self.token.clone(),
@@ -277,9 +277,8 @@ impl AdapterApp {
 
         if let Some(initial) = config.raw.get("initial_data").filter(|v| v.is_object()) {
             let mut initial = initial.clone();
-            initial["session_token"] = json!(self.token);
             initial["mod_id"] = config.mod_id.clone();
-            if let Err(e) = post(&self.http, &format!("{}?action=sync", config.api), &initial) {
+            if let Err(e) = session.api.call(&self.http, "sync", &self.token, Some(&initial)) {
                 self.fail(format!("Startdaten senden fehlgeschlagen: {e}"));
             }
         }

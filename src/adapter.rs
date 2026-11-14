@@ -170,7 +170,7 @@ impl Shared {
 /// Everything both worker threads need once a session token exists.
 #[derive(Clone)]
 pub struct Session {
-    pub api: String,
+    pub api: Api,
     pub game_dir: PathBuf,
     pub sync_file: PathBuf,
     pub token: String,
@@ -287,8 +287,81 @@ fn reply(url: &str, res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) 
     serde_json::from_str(&body).map_err(|e| rejected(e.to_string()))
 }
 
-pub fn post(http: &ureq::Agent, url: &str, body: &Value) -> Result<Value, HttpError> {
+fn post(http: &ureq::Agent, url: &str, body: &Value) -> Result<Value, HttpError> {
     reply(url, http.post(url).send_json(body))
+}
+
+/// Where requests go. AUBLst from adapter API v1 on takes fixed paths with the session
+/// code in a header, so it lands in no access log; other servers only know
+/// `api.php?action=…` with the code in the body or URL.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Api {
+    V1(String),
+    Legacy(String),
+}
+
+/// api.php actions and their v1 paths, as in AUBLst's backend/adapter-api.yaml.
+const ROUTES: [(&str, &str); 5] = [
+    ("session_create", "/sessions"),
+    ("sync", "/session/sync"),
+    ("commands_pending", "/session/commands"),
+    ("commands_ack", "/session/commands/ack"),
+    ("adapter_log", "/session/log"),
+];
+
+impl Api {
+    /// Asks once per session. A server that can't tell stays on api.php, which every
+    /// version understands.
+    pub fn detect(http: &ureq::Agent, api_php: &str) -> Api {
+        let url = format!("{api_php}?action=capabilities");
+        let v1 = reply(&url, http.get(&url).call()).is_ok_and(|c| c["adapter_api"].as_u64().is_some_and(|v| v >= 1));
+        match api_php.strip_suffix("api.php") {
+            Some(base) if v1 => Api::V1(format!("{base}adapter.php/v1")),
+            _ => Api::Legacy(api_php.to_string()),
+        }
+    }
+
+    /// A GET without `body`. An empty token sends none, as for `session_create`.
+    pub fn call(&self, http: &ureq::Agent, action: &str, token: &str, body: Option<&Value>) -> Result<Value, HttpError> {
+        match self {
+            Api::V1(base) => {
+                let path = ROUTES.iter().find(|(a, _)| *a == action).map(|(_, p)| p).expect("every action has a route");
+                let url = format!("{base}{path}");
+                let auth = (!token.is_empty()).then(|| format!("Bearer {token}"));
+                match body {
+                    Some(body) => {
+                        let req = http.post(&url);
+                        let req = match &auth {
+                            Some(a) => req.header("Authorization", a),
+                            None => req,
+                        };
+                        reply(&url, req.send_json(body))
+                    }
+                    None => {
+                        let req = http.get(&url);
+                        let req = match &auth {
+                            Some(a) => req.header("Authorization", a),
+                            None => req,
+                        };
+                        reply(&url, req.call())
+                    }
+                }
+            }
+            Api::Legacy(api) => {
+                let url = format!("{api}?action={action}");
+                match body {
+                    Some(body) => {
+                        let mut body = body.clone();
+                        if !token.is_empty() {
+                            body["session_token"] = json!(token);
+                        }
+                        post(http, &url, &body)
+                    }
+                    None => reply(&url, http.get(&url).query("session_token", token).call()),
+                }
+            }
+        }
+    }
 }
 
 /// Resolves a relative path against the exe's folder instead of whatever working
@@ -469,8 +542,8 @@ impl Batch {
         .join(", ")
     }
 
-    pub fn payload(&self, token: &str, mod_id: &str) -> Value {
-        let mut data = json!({ "session_token": token, "mod_id": mod_id });
+    pub fn payload(&self, mod_id: &str) -> Value {
+        let mut data = json!({ "mod_id": mod_id });
         let mut put = |key: &str, value: Value| data[key] = value;
         if !self.vehicles.is_empty() {
             put("vehicles", Value::Array(self.vehicles.clone()));
@@ -638,9 +711,8 @@ pub fn run_log_monitor(s: Session) {
             Err(e) => s.fail(format!("Logdatei {}: {e}", log.display())),
         }
         if batch.has_data() {
-            let url = format!("{}?action=sync", s.api);
-            let payload = batch.payload(&s.token, &s.mod_id);
-            let rejection = match post(&s.http, &url, &payload) {
+            let payload = batch.payload(&s.mod_id);
+            let rejection = match s.api.call(&s.http, "sync", &s.token, Some(&payload)) {
                 // Only drop what the server confirmed; anything else goes out again next round.
                 Ok(res) if res["ok"] == true => {
                     if !sending {
@@ -751,7 +823,6 @@ pub fn run_log_uploader(s: Session) {
 /// Entries stay queued while the server is unreachable; a server that refuses them
 /// (an AUBLst without `adapter_log`) won't take them later either, so they are dropped.
 fn send_log(s: &Session) {
-    let url = format!("{}?action=adapter_log", s.api);
     // Goes along every time, even without entries: the dispatch shows from it whether
     // a command can reach the game right now.
     let status = json!({
@@ -770,7 +841,7 @@ fn send_log(s: &Session) {
             return;
         }
         first = false;
-        match post(&s.http, &url, &json!({ "session_token": s.token, "entries": chunk, "status": status })) {
+        match s.api.call(&s.http, "adapter_log", &s.token, Some(&json!({ "entries": chunk, "status": status }))) {
             Ok(_) => {}
             Err(e) if e.rejected => log_error(&format!("Log senden abgelehnt: {e}")),
             Err(_) => {
@@ -830,8 +901,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<Duration, Str
     if !s.round_active() {
         return Ok(Duration::from_secs(1));
     }
-    let url = format!("{}?action=commands_pending", s.api);
-    let res = match reply(&url, s.http.get(&url).query("session_token", &s.token).call()) {
+    let res = match s.api.call(&s.http, "commands_pending", &s.token, None) {
         Ok(res) => {
             s.update(|sh| sh.server_down_since = None);
             res
@@ -881,11 +951,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<Duration, Str
     if unacked.is_empty() {
         return Ok(wait);
     }
-    let acked = post(
-        &s.http,
-        &format!("{}?action=commands_ack", s.api),
-        &json!({ "session_token": s.token, "command_ids": unacked }),
-    );
+    let acked = s.api.call(&s.http, "commands_ack", &s.token, Some(&json!({ "command_ids": unacked })));
     if acked.is_ok() {
         unacked.clear();
     }
@@ -955,8 +1021,8 @@ mod tests {
         assert_eq!(b.process_line("!LSTcmd::i3|abc").as_deref(), Some("3|abc"));
         assert!(b.has_data());
         assert_eq!(
-            b.payload("tok", "mod"),
-            json!({ "session_token": "tok", "mod_id": "mod", "vehicles": [{ "id": 1 }],
+            b.payload("mod"),
+            json!({ "mod_id": "mod", "vehicles": [{ "id": 1 }],
                     "players": { "0": "Anna", "1": "Bob", "2": "" }, "time": { "h": 12 } })
         );
 
@@ -970,7 +1036,7 @@ mod tests {
         merged.process_line(r#"!LSTcmd::v{"game_vehicle_id":2}"#);
         merged.process_line(r#"!LSTcmd::v{"x":3}"#);
         assert_eq!(
-            merged.payload("t", "m")["vehicles"],
+            merged.payload("m")["vehicles"],
             json!([{ "game_vehicle_id": "1", "x": 5, "s": 2 }, { "game_vehicle_id": 2 }, { "x": 3 }])
         );
     }
@@ -1034,7 +1100,7 @@ mod tests {
 
     fn session(sync_file: &Path, api: &str) -> Session {
         Session {
-            api: api.into(),
+            api: Api::Legacy(api.into()),
             game_dir: PathBuf::new(),
             sync_file: sync_file.into(),
             token: "tok".into(),
@@ -1140,6 +1206,37 @@ mod tests {
     }
 
     #[test]
+    fn api_v1_carries_the_code_in_the_header_and_old_servers_keep_api_php() {
+        let (url, server) = serve(vec![
+            ("200 OK", r#"{"api_version":1,"adapter_api":1}"#),
+            ("200 OK", r#"{"commands":[]}"#),
+            ("200 OK", r#"{"ok":true}"#),
+            ("200 OK", r#"{"ok":true,"session_token":"ab12"}"#),
+            ("200 OK", r#"{"api_version":1}"#),
+        ]);
+        let api = Api::detect(&agent(), &url);
+        assert_eq!(api, Api::V1(url.replace("api.php", "adapter.php/v1")));
+        api.call(&agent(), "commands_pending", "tok", None).unwrap();
+        api.call(&agent(), "commands_ack", "tok", Some(&json!({ "command_ids": ["7"] }))).unwrap();
+        api.call(&agent(), "session_create", "", Some(&json!({ "mod_id": "AUBMP" }))).unwrap();
+        assert_eq!(Api::detect(&agent(), &url), Api::Legacy(url.clone()));
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /api.php?action=capabilities "));
+        assert!(requests[1].starts_with("GET /adapter.php/v1/session/commands "));
+        assert!(requests[2].starts_with("POST /adapter.php/v1/session/commands/ack "));
+        assert!(requests[3].starts_with("POST /adapter.php/v1/sessions "));
+        for r in &requests[1..3] {
+            assert!(r.to_ascii_lowercase().contains("\r\nauthorization: bearer tok\r\n"), "{r}");
+            assert!(!r.contains("session_token"), "{r}");
+        }
+        assert!(!requests[3].to_ascii_lowercase().contains("authorization"));
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let unreachable = format!("http://{closed}/api.php");
+        assert_eq!(Api::detect(&agent(), &unreachable), Api::Legacy(unreachable.clone()));
+    }
+
+    #[test]
     fn after_a_restart_only_the_handshake_opens_the_round() {
         let sync_file = temp("take.txt");
         let s = session(&sync_file, "");
@@ -1207,7 +1304,7 @@ mod tests {
         assert_eq!(s.shared.lock().unwrap().outbox.len(), OUTBOX_BATCH + 3);
 
         let (url, server) = serve(vec![("200 OK", r#"{"ok":true}"#), ("400 Bad Request", r#"{"error":"Unknown action"}"#)]);
-        let s = Session { api: url, ..s };
+        let s = Session { api: Api::Legacy(url), ..s };
         send_log(&s);
         assert!(s.shared.lock().unwrap().outbox.is_empty(), "a refused batch is dropped as well");
         let requests = server.join().unwrap();

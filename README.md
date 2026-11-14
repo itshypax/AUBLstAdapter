@@ -10,7 +10,7 @@ Eine einzelne `AUBLstAdapter.exe`, ohne .NET und ohne Installation. Bis v1.3.0 h
 2. `example_config.cfg` als `config.cfg` neben die Exe legen und ausfüllen:
    - `mod_id` (oben und in `request_data`): die ID, unter der das Kartenbild der Mod beim Server liegt.
    - `map_bounds`: bei einer vollen Freeplay-Karte so lassen.
-   - `server_path`: die API des Servers, z. B. `https://example.org/backend/api.php`.
+   - `server_path`: die API des Servers, z. B. `https://example.org/backend/api.php`. Meldet der Server dort die Adapter-API v1 (AUBLst ab November 2026), spricht der Adapter `adapter.php/v1` daneben an und schickt den Sitzungscode im Header statt in URL und Body. Andere Server bekommen weiter die `api.php?action=`-Aufrufe.
    - `sync_path`: die Datei, in die der Adapter Befehle schreibt, relativ zum Spielordner. Ohne Angabe `input.txt`.
    - `initial_data` (optional): wird direkt nach dem Verbinden einmal an `sync` geschickt.
 3. Beides zusammen mit der Mod ausliefern.
