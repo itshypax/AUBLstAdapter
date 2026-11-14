@@ -10,11 +10,30 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release
       - run: cargo build --release
+      # Without the secret the release goes out with the checksum only.
+      - if: env.VT_API_KEY != ''
+        uses: crazy-max/ghaction-virustotal@v5
+        with:
+          vt_api_key: ${{ env.VT_API_KEY }}
+          files: target/release/emlst-adapter.exe
+          request_rate: 4
+      - name: Release notes
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/emlst-adapter.exe -Algorithm SHA256).Hash.ToLower()
+          $notes = @('## Download prüfen', '', "SHA-256 von ``emlst-adapter.exe``: ``$hash``")
+          if ($env:VT_API_KEY) {
+            $notes += '', "Virenscan: [Ergebnis auf VirusTotal](https://www.virustotal.com/gui/file/$hash)"
+          }
+          $notes | Set-Content release-notes.md -Encoding utf8
       - uses: softprops/action-gh-release@v3
         with:
           files: target/release/emlst-adapter.exe
+          body_path: release-notes.md

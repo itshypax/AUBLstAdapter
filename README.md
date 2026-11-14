@@ -34,7 +34,7 @@ cargo test
 cargo run
 ```
 
-`src/adapter.rs` enthält Logdatei, Sync-Datei und die Abfragen an den Server, `src/main.rs` das Fenster (egui). Ein Tag `v*` baut die Exe und hängt sie an ein Release.
+`src/adapter.rs` enthält Logdatei, Sync-Datei und die Abfragen an den Server, `src/main.rs` das Fenster (egui). Ein Tag `v*` baut die Exe und hängt sie an ein Release, mit SHA-256 in den Release-Notes. Ist das Secret `VT_API_KEY` gesetzt (API-Schlüssel eines VirusTotal-Kontos), lädt der Workflow die Exe vorher zu VirusTotal hoch und verlinkt das Ergebnis.
 
 Zum Bauen braucht es `rc.exe` aus dem Windows SDK, das der Exe das AUBLst-Symbol gibt.
 
