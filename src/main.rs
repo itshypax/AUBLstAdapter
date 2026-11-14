@@ -365,8 +365,8 @@ impl AdapterApp {
                         self.disconnect();
                     }
                 } else {
-                    let label = RichText::new(with_icon(icon::CONNECT, "Code anfordern")).size(15.0).color(theme::STRONG);
-                    let button = egui::Button::new(label).fill(theme::ACCENT).min_size(BIG_BUTTON);
+                    let label = RichText::new(with_icon(icon::CONNECT, "Code anfordern")).size(15.0).color(theme::ON_PRIMARY);
+                    let button = egui::Button::new(label).fill(theme::PRIMARY).min_size(BIG_BUTTON);
                     let hover = "Für einen Code braucht es Spielordner und Config.";
                     if ui.add_enabled(self.ready(), button).on_disabled_hover_text(hover).clicked() {
                         self.request_token();

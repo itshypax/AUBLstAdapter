@@ -16,7 +16,9 @@ pub const TEXT: Color32 = Color32::from_rgb(233, 234, 236);
 pub const STRONG: Color32 = Color32::WHITE;
 pub const DIM: Color32 = Color32::from_rgb(154, 157, 164);
 pub const HINT: Color32 = Color32::from_rgb(92, 95, 101);
-pub const ACCENT: Color32 = Color32::from_rgb(76, 141, 255);
+// Primary buttons and selected tabs are light with dark text, as in the frontend.
+pub const PRIMARY: Color32 = Color32::from_rgb(233, 234, 236);
+pub const ON_PRIMARY: Color32 = BG;
 pub const LINK: Color32 = Color32::from_rgb(143, 182, 255);
 pub const GOOD: Color32 = Color32::from_rgb(46, 201, 142);
 pub const WARN: Color32 = Color32::from_rgb(240, 160, 60);
@@ -61,8 +63,8 @@ pub fn visuals() -> egui::Visuals {
     v.text_edit_bg_color = Some(FIELD);
     v.hyperlink_color = LINK;
     v.weak_text_color = Some(DIM);
-    v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, STRONG);
+    v.selection.bg_fill = PRIMARY;
+    v.selection.stroke = Stroke::new(1.0, ON_PRIMARY);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
     for (w, fill) in [(&mut v.widgets.inactive, BUTTON), (&mut v.widgets.hovered, BUTTON_HOVER), (&mut v.widgets.active, BUTTON_HOVER)] {
