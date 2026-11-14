@@ -722,22 +722,20 @@ fn take_lines(s: &Session, batch: &mut Batch, lines: &[String], restarted: bool,
     }
 }
 
-/// Fetches pending commands every second and hands them to the game. After a failed
-/// request it waits five, so a server in trouble isn't asked every second.
+/// Fetches pending commands and hands them to the game, as often as the server asks
+/// (see `next_poll`). After a failed request it waits five seconds, so a server in
+/// trouble isn't asked every second.
 pub fn run_command_poller(s: Session) {
     let mut unacked = Vec::new();
     while !s.stopped() {
         if !game_running() {
             s.set_round(false);
         }
-        let wait = match poll_commands(&s, &mut unacked) {
-            Ok(()) => 1,
-            Err(e) => {
-                s.fail(e);
-                5
-            }
-        };
-        s.pause(Duration::from_secs(wait));
+        let wait = poll_commands(&s, &mut unacked).unwrap_or_else(|e| {
+            s.fail(e);
+            Duration::from_secs(5)
+        });
+        s.pause(wait);
     }
 }
 
@@ -812,10 +810,16 @@ pub fn game_running() -> bool {
 
 /// `unacked` holds ids already in the sync file whose ack failed. The server sends them
 /// again until the ack gets through, and writing them twice would run them twice.
-fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
+/// When to ask again: AUBLst sends `poll_ms`, 1 s while a dispatch has the session
+/// open and longer when nobody could send commands. Older servers send nothing.
+fn next_poll(res: &Value) -> Duration {
+    Duration::from_millis(res["poll_ms"].as_u64().unwrap_or(1000).clamp(1000, 10_000))
+}
+
+fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<Duration, String> {
     // Outside a round the commands stay on the server until the game is there to read them.
     if !s.round_active() {
-        return Ok(());
+        return Ok(Duration::from_secs(1));
     }
     let url = format!("{}?action=commands_pending", s.api);
     let res = match reply(&url, s.http.get(&url).query("session_token", &s.token).call()) {
@@ -832,6 +836,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
             return Err(format!("Befehle abholen: {e}"));
         }
     };
+    let wait = next_poll(&res);
     let mut lines = Vec::new();
     let mut ids = Vec::new();
     let mut notes = Vec::new();
@@ -856,7 +861,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
     // may have ended while the request ran, so `deliver` checks once more under the lock.
     if !lines.is_empty() {
         if !s.deliver(&lines).map_err(|e| format!("Sync-Datei: {e}"))? {
-            return Ok(());
+            return Ok(wait);
         }
         for note in notes {
             s.note(Level::Info, format!("Ans Spiel: {note}"));
@@ -865,7 +870,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
         unacked.extend(ids);
     }
     if unacked.is_empty() {
-        return Ok(());
+        return Ok(wait);
     }
     let acked = post(
         &s.http,
@@ -877,7 +882,7 @@ fn poll_commands(s: &Session, unacked: &mut Vec<String>) -> Result<(), String> {
     }
     s.update(|sh| sh.unacked = unacked.len());
     acked.map_err(|e| format!("Server hat {} Befehle nicht bestätigt: {e}", unacked.len()))?;
-    Ok(())
+    Ok(wait)
 }
 
 #[cfg(test)]
@@ -1086,6 +1091,16 @@ mod tests {
 
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(!post(&agent(), &format!("http://{closed}/"), &json!({})).unwrap_err().rejected);
+    }
+
+    #[test]
+    fn the_server_sets_the_poll_interval_within_bounds() {
+        let wait = |v: Value| next_poll(&v).as_millis();
+        assert_eq!(wait(json!({"commands": []})), 1000);
+        assert_eq!(wait(json!({"poll_ms": 5000})), 5000);
+        assert_eq!(wait(json!({"poll_ms": 10})), 1000);
+        assert_eq!(wait(json!({"poll_ms": 600000})), 10_000);
+        assert_eq!(wait(json!({"poll_ms": "5000"})), 1000);
     }
 
     #[test]

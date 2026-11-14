@@ -19,9 +19,9 @@ Eine einzelne `emlst-adapter.exe`, ohne .NET und ohne Installation.
 
 Spielordner und Config wählen (beides merkt sich der Adapter), optional eine PIN eintragen und "Code anfordern" drücken. Ab dann läuft die Verbindung. Code und Leitstellen-Link lassen sich kopieren, der Link auch direkt im Browser öffnen. "Spiel starten" startet `Em4.exe` mit der Mod. Wer Spielordner oder Config ändern will, trennt vorher; ein Neustart des Adapters ist dafür nicht nötig.
 
-Unter den Einstellungen stehen Status und Log, beide einklappbar. Zugeklappt zeigt der Status nur, ob alles läuft oder was fehlt, und das Log nur seinen letzten Eintrag. Aufgeklappt gibt es das Adapter-Log und die rohen Zeilen aus der `logfile.txt` des Spiels.
+Unter den Einstellungen stehen Status und Log, beide einklappbar. Zugeklappt zeigt der Status in wenigen Worten, ob alles läuft oder was am dringendsten fehlt, und das Log nur seinen letzten Eintrag. Aufgeklappt gibt es das Adapter-Log und die rohen Zeilen aus der `logfile.txt` des Spiels.
 
-Befehle der Leitstelle holt der Adapter jede Sekunde ab, aber nur, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Antwortet der Server nicht, fragt er nur noch alle fünf Sekunden. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
+Befehle der Leitstelle holt der Adapter jede Sekunde ab, aber nur, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Hat gerade keine Leitstelle die Sitzung offen, sagt AUBLst ihm, dass alle fünf Sekunden reichen. Antwortet der Server nicht, fragt er ebenfalls nur alle fünf Sekunden. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
 
 Fehler stehen im Log des Fensters und in `error.log` neben der Exe.
 
