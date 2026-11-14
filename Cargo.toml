@@ -1,7 +1,11 @@
 [package]
-name = "emlst-adapter"
+name = "aublst-adapter"
 version = "1.3.0"
 edition = "2024"
+
+[[bin]]
+name = "AUBLstAdapter"
+path = "src/main.rs"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

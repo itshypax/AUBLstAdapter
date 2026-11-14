@@ -370,6 +370,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aublst-adapter"
+version = "1.3.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "rfd",
+ "serde_json",
+ "ureq",
+ "windows-sys 0.61.2",
+ "winreg",
+ "winresource",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -868,20 +882,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e73ce90f54750be8672c02be0743fe47530e6f251e066f0ee2869b59eb297af5"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "emlst-adapter"
-version = "1.3.0"
-dependencies = [
- "chrono",
- "eframe",
- "rfd",
- "serde_json",
- "ureq",
- "windows-sys 0.61.2",
- "winreg",
- "winresource",
 ]
 
 [[package]]

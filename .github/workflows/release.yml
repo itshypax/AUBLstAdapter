@@ -22,18 +22,18 @@ jobs:
         uses: crazy-max/ghaction-virustotal@v5
         with:
           vt_api_key: ${{ env.VT_API_KEY }}
-          files: target/release/emlst-adapter.exe
+          files: target/release/AUBLstAdapter.exe
           request_rate: 4
       - name: Release notes
         shell: pwsh
         run: |
-          $hash = (Get-FileHash target/release/emlst-adapter.exe -Algorithm SHA256).Hash.ToLower()
-          $notes = @('## Download prüfen', '', "SHA-256 von ``emlst-adapter.exe``: ``$hash``")
+          $hash = (Get-FileHash target/release/AUBLstAdapter.exe -Algorithm SHA256).Hash.ToLower()
+          $notes = @('## Download prüfen', '', "SHA-256 von ``AUBLstAdapter.exe``: ``$hash``")
           if ($env:VT_API_KEY) {
             $notes += '', "Virenscan: [Ergebnis auf VirusTotal](https://www.virustotal.com/gui/file/$hash)"
           }
           $notes | Set-Content release-notes.md -Encoding utf8
       - uses: softprops/action-gh-release@v3
         with:
-          files: target/release/emlst-adapter.exe
+          files: target/release/AUBLstAdapter.exe
           body_path: release-notes.md

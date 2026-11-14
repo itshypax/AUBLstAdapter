@@ -2,11 +2,11 @@
 
 Läuft auf dem Rechner mit Emergency 4 und verbindet das Spiel mit einer [AUBLst](https://github.com/itshypax/AUBLst)-Leitstelle. Der Adapter liest, was die Mod in die `logfile.txt` des Spiels schreibt (Fahrzeuge, Einsätze, Krankenhäuser, Funkmeldungen), schickt es an den Server und schreibt die Befehle der Leitstelle in die Sync-Datei, die die Mod liest.
 
-Eine einzelne `emlst-adapter.exe`, ohne .NET und ohne Installation.
+Eine einzelne `AUBLstAdapter.exe`, ohne .NET und ohne Installation. Bis v1.3.0 hieß sie `emlst-adapter.exe`.
 
 ## Mit der eigenen Mod ausliefern
 
-1. `emlst-adapter.exe` aus dem [neuesten Release](../../releases/latest) laden.
+1. `AUBLstAdapter.exe` aus dem [neuesten Release](../../releases/latest) laden.
 2. `example_config.cfg` als `config.cfg` neben die Exe legen und ausfüllen:
    - `mod_id` (oben und in `request_data`): die ID, unter der das Kartenbild der Mod beim Server liegt.
    - `map_bounds`: bei einer vollen Freeplay-Karte so lassen.
@@ -22,6 +22,8 @@ Spielordner und Config wählen (beides merkt sich der Adapter), optional eine PI
 Unter den Einstellungen stehen Status und Log, beide einklappbar. Zugeklappt zeigt der Status in wenigen Worten, ob alles läuft oder was am dringendsten fehlt, und das Log nur seinen letzten Eintrag. Aufgeklappt gibt es das Adapter-Log und die rohen Zeilen aus der `logfile.txt` des Spiels.
 
 Befehle der Leitstelle holt der Adapter jede Sekunde ab, aber nur, solange `Em4.exe` läuft und die Mod sich in dieser Runde gemeldet hat. Hat gerade keine Leitstelle die Sitzung offen, sagt AUBLst ihm, dass alle fünf Sekunden reichen. Antwortet der Server nicht, fragt er ebenfalls nur alle fünf Sekunden. Was die Leitstelle schickt, während das Spiel zu ist, bleibt auf dem Server liegen und kommt nach dem nächsten Spielstart an. Lehnt der Server dieselben Spieldaten fünfmal ab, verwirft der Adapter sie und schreibt sie ins `error.log`, damit spätere Meldungen wieder durchkommen.
+
+Beim Start schaut der Adapter, ob es auf GitHub ein neueres Release gibt, und lädt es im Hintergrund. Ist keine Sitzung offen, tauscht er seine Exe aus und startet neu; läuft gerade eine, wartet er bis zum Trennen. Config, Spielordner und Einstellungen bleiben dabei, wie sie sind. Wer noch v1.3.0 oder älter hat, holt sich die neue Exe einmal von Hand.
 
 Fehler stehen im Log des Fensters und in `error.log` neben der Exe.
 

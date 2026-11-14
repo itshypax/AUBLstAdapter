@@ -2,6 +2,7 @@
 
 mod adapter;
 mod theme;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +102,8 @@ struct AdapterApp {
     follow_log: bool,
     copied: Option<(&'static str, Instant)>,
     logo: Option<egui::TextureHandle>,
+    update: Arc<Mutex<Option<update::Ready>>>,
+    update_waiting: bool,
 }
 
 impl AdapterApp {
@@ -134,10 +137,31 @@ impl AdapterApp {
             follow_log: true,
             copied: None,
             logo,
+            update: Arc::new(Mutex::new(None)),
+            update_waiting: false,
         };
         app.check_game_dir();
         app.reload_config();
+        let (shared, slot) = (app.shared.clone(), app.update.clone());
+        std::thread::spawn(move || *slot.lock().unwrap() = update::fetch(&shared));
         app
+    }
+
+    /// A downloaded update goes in only while no session is open: the restart would drop it.
+    fn apply_update(&mut self) {
+        let Some(ready) = self.update.lock().unwrap().clone() else { return };
+        if self.session.is_some() {
+            if !self.update_waiting {
+                self.note(Level::Info, &format!("Version {} geladen, wird nach dem Trennen installiert", ready.version));
+                self.update_waiting = true;
+            }
+            return;
+        }
+        *self.update.lock().unwrap() = None;
+        match update::install(&ready) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => self.fail(format!("Update auf {} fehlgeschlagen: {e}", ready.version)),
+        }
     }
 
     fn fail(&self, text: String) {
@@ -330,15 +354,17 @@ impl AdapterApp {
     }
 
     fn header(&self, ui: &mut Ui, rows: &[StatusRow; 4]) {
+        // Like the connection note in the AUBLst top bar: icon and coloured text, no frame.
         let (color, text) = if self.session.is_none() {
-            (theme::OFF, "Getrennt")
+            (theme::DIM, "Getrennt")
         } else if rows.iter().any(|r| r.0 == theme::BAD) {
-            (theme::BAD, "Störung")
+            (theme::BAD_TEXT, "Störung")
         } else if rows[2].0 != theme::GOOD {
-            (theme::WARN, "Wartet aufs Spiel")
+            (theme::WARN_TEXT, "Wartet aufs Spiel")
         } else {
-            (if rows.iter().all(|r| r.0 == theme::GOOD) { theme::GOOD } else { theme::WARN }, "Verbunden")
+            (if rows.iter().all(|r| r.0 == theme::GOOD) { theme::GOOD_TEXT } else { theme::WARN_TEXT }, "Verbunden")
         };
+        let wifi = if color == theme::GOOD_TEXT { icon::WIFI } else { icon::WIFI_OFF };
         ui.horizontal(|ui| {
             if let Some(logo) = &self.logo {
                 ui.add(egui::Image::from_texture((logo.id(), vec2(32.0, 32.0))).corner_radius(5));
@@ -349,17 +375,9 @@ impl AdapterApp {
                 ui.label(RichText::new("Emergency 4 und Leitstelle verbinden").size(11.5).color(theme::DIM));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                egui::Frame::new()
-                    .fill(color.gamma_multiply(0.12))
-                    .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
-                    .corner_radius(12)
-                    .inner_margin(Margin::symmetric(10, 3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            dot(ui, color);
-                            ui.label(text);
-                        });
-                    });
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new(text).size(12.0).color(color));
+                ui.label(RichText::new(wifi).size(14.0).color(color));
             });
         });
     }
@@ -652,6 +670,7 @@ impl eframe::App for AdapterApp {
             self.game_running = adapter::game_running();
             self.game_checked = Some(Instant::now());
         }
+        self.apply_update();
         let rows = self.status_rows();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::same(12))).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);

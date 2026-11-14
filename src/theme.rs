@@ -24,6 +24,10 @@ pub const GOOD: Color32 = Color32::from_rgb(46, 201, 142);
 pub const WARN: Color32 = Color32::from_rgb(240, 160, 60);
 pub const BAD: Color32 = Color32::from_rgb(232, 82, 74);
 pub const OFF: Color32 = Color32::from_rgb(90, 92, 97);
+// Status written as text, lighter than the dots (--good-text and friends).
+pub const GOOD_TEXT: Color32 = Color32::from_rgb(98, 217, 173);
+pub const WARN_TEXT: Color32 = Color32::from_rgb(255, 195, 107);
+pub const BAD_TEXT: Color32 = Color32::from_rgb(255, 133, 128);
 pub const DANGER_FILL: Color32 = Color32::from_rgb(128, 45, 41);
 pub const WARN_FILL: Color32 = Color32::from_rgb(144, 96, 36);
 pub const WARN_BG: Color32 = Color32::from_rgb(36, 30, 22);
@@ -44,6 +48,8 @@ pub mod icon {
     pub const INFO: &str = "\u{E06C}";
     pub const WARN: &str = "\u{E4E0}";
     pub const BAD: &str = "\u{E4E4}";
+    pub const WIFI: &str = "\u{E4EA}";
+    pub const WIFI_OFF: &str = "\u{E4F2}";
 }
 
 pub fn with_icon(icon: &str, text: &str) -> String {
