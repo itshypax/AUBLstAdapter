@@ -17,7 +17,9 @@ Eine einzelne `AUBLstAdapter.exe`, ohne .NET und ohne Installation. Bis v1.3.0 h
 
 ## Benutzen
 
-Spielordner und Config wählen (beides merkt sich der Adapter), optional eine PIN eintragen und "Code anfordern" drücken. Ab dann läuft die Verbindung. Code und Leitstellen-Link lassen sich kopieren, der Link auch direkt im Browser öffnen. "Spiel starten" startet `Em4.exe` mit der Mod. Wer Spielordner oder Config ändern will, trennt vorher; ein Neustart des Adapters ist dafür nicht nötig.
+Beim ersten Start sucht der Adapter den Spielordner selbst: zuerst in den Ordnern über der Exe (so liefert eine Mod ihn aus), dann in allen Steam-Bibliotheken, dann in der Standardinstallation. Die Config nimmt er von neben der Exe, sonst aus `Mods`, aber nur eine, deren `mod_id` wie ihr Mod-Ordner heißt, denn unter diesem Namen startet das Spiel die Mod. Passen mehrere gleich gut, wählt man selbst.
+
+Spielordner und Config lassen sich jederzeit selbst wählen (beides merkt sich der Adapter), optional eine PIN eintragen und "Code anfordern" drücken. Ab dann läuft die Verbindung. Code und Leitstellen-Link lassen sich kopieren, der Link auch direkt im Browser öffnen. "Spiel starten" startet `Em4.exe` mit der Mod. Wer Spielordner oder Config ändern will, trennt vorher; ein Neustart des Adapters ist dafür nicht nötig.
 
 Unter den Einstellungen stehen Status und Log, beide einklappbar. Zugeklappt zeigt der Status in wenigen Worten, ob alles läuft oder was am dringendsten fehlt, und das Log nur seinen letzten Eintrag. Aufgeklappt gibt es das Adapter-Log und die rohen Zeilen aus der `logfile.txt` des Spiels.
 
@@ -27,7 +29,7 @@ Beim Start schaut der Adapter, ob es auf GitHub ein neueres Release gibt, und l�
 
 Fehler stehen im Log des Fensters und in `error.log` neben der Exe.
 
-Solange eine Sitzung läuft, schickt der Adapter das Log des Fensters alle fünf Sekunden an den Server (`adapter_log`). Der Betreiber kann es dort 24 Stunden lang in der Betreiberansicht nachlesen. Vorher ersetzt der Adapter das Benutzerprofil in Pfaden (etwa `C:\Users\Name`) durch `~` und IP-Adressen durch `<IP>`. PIN, Spielernamen und die Zeilen aus der `logfile.txt` gehen nicht mit, abgelehnte Spieldaten stehen nur im `error.log`. Ist der Server nicht erreichbar, hält der Adapter bis zu 500 Einträge zurück und versucht es später noch einmal.
+Solange eine Sitzung läuft, schickt der Adapter das Log des Fensters alle fünf Sekunden an den Server (`adapter_log`), dazu jedes Mal, ob das Spiel läuft, ob die Mod in einer Runde ist und seine Version. Daraus zeigt die Leitstelle in der Kopfzeile, ob Befehle gerade im Spiel ankommen können. Der Betreiber kann es dort 24 Stunden lang in der Betreiberansicht nachlesen. Vorher ersetzt der Adapter das Benutzerprofil in Pfaden (etwa `C:\Users\Name`) durch `~` und IP-Adressen durch `<IP>`. PIN, Spielernamen und die Zeilen aus der `logfile.txt` gehen nicht mit, abgelehnte Spieldaten stehen nur im `error.log`. Ist der Server nicht erreichbar, hält der Adapter bis zu 500 Einträge zurück und versucht es später noch einmal.
 
 Wer bisher den C#-Adapter benutzt hat, muss nichts neu einstellen: Spielordner und Config liegen unter demselben Registry-Schlüssel (`HKCU\Software\EMLst`).
 

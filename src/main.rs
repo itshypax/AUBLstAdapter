@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adapter;
+mod setup;
 mod theme;
 mod update;
 
@@ -142,6 +143,7 @@ impl AdapterApp {
         };
         app.check_game_dir();
         app.reload_config();
+        app.auto_setup();
         let (shared, slot) = (app.shared.clone(), app.update.clone());
         std::thread::spawn(move || *slot.lock().unwrap() = update::fetch(&shared));
         app
@@ -172,11 +174,35 @@ impl AdapterApp {
         self.shared.lock().unwrap().push(level, text.into());
     }
 
+    /// First start, or the game moved: look where a mod or Steam puts things before asking.
+    /// A config that is there but broken stays, so its error stays visible.
+    fn auto_setup(&mut self) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        if !matches!(self.game_dir_state, Pick::Ok)
+            && let Some(dir) = setup::find_game_dir(&exe)
+        {
+            self.game_dir = dir.display().to_string();
+            write_setting(REG_GAME_DIR, &self.game_dir);
+            self.check_game_dir();
+            self.note(Level::Good, &format!("Spielordner gefunden: {}", self.game_dir));
+        }
+        if matches!(self.config_state, Pick::Missing) {
+            let game = matches!(self.game_dir_state, Pick::Ok).then(|| PathBuf::from(&self.game_dir));
+            let mod_id = |p: &Path| load_config(p).ok().map(|c| plain(&c.mod_id));
+            if let Some(file) = setup::find_config(&exe, game.as_deref(), mod_id) {
+                self.config_path = file.display().to_string();
+                write_setting(REG_CONFIG, &self.config_path);
+                self.reload_config();
+                self.note(Level::Good, &format!("Config gefunden: {}", self.config_path));
+            }
+        }
+    }
+
     fn check_game_dir(&mut self) {
         let dir = Path::new(&self.game_dir);
         self.game_dir_state = if !dir.is_dir() {
             Pick::Missing
-        } else if !dir.join("Em4.exe").is_file() {
+        } else if !setup::is_game_dir(dir) {
             Pick::Broken("Hier liegt keine Em4.exe".into())
         } else {
             Pick::Ok

@@ -752,16 +752,25 @@ pub fn run_log_uploader(s: Session) {
 /// (an AUBLst without `adapter_log`) won't take them later either, so they are dropped.
 fn send_log(s: &Session) {
     let url = format!("{}?action=adapter_log", s.api);
+    // Goes along every time, even without entries: the dispatch shows from it whether
+    // a command can reach the game right now.
+    let status = json!({
+        "game": game_running(),
+        "round": s.shared.lock().unwrap().round_since.is_some(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let mut first = true;
     loop {
         let chunk: Vec<Value> = {
             let mut sh = s.shared.lock().unwrap();
             let n = sh.outbox.len().min(OUTBOX_BATCH);
             sh.outbox.drain(..n).collect()
         };
-        if chunk.is_empty() || s.stopped() {
+        if (chunk.is_empty() && !first) || s.stopped() {
             return;
         }
-        match post(&s.http, &url, &json!({ "session_token": s.token, "entries": chunk })) {
+        first = false;
+        match post(&s.http, &url, &json!({ "session_token": s.token, "entries": chunk, "status": status })) {
             Ok(_) => {}
             Err(e) if e.rejected => log_error(&format!("Log senden abgelehnt: {e}")),
             Err(_) => {
