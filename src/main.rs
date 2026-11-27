@@ -483,9 +483,9 @@ impl AdapterApp {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button(with_icon(icon::OPEN, "Öffnen")).clicked()
-                        && let Err(e) = std::process::Command::new("explorer").arg(&url).spawn()
+                        && !open_in_browser(&url)
                     {
-                        self.fail(format!("Browser öffnen fehlgeschlagen: {e}"));
+                        self.fail("Browser öffnen fehlgeschlagen".into());
                     }
                     let (label, done) = (with_icon(icon::LINK, "Link kopieren"), with_icon(icon::CHECK, "Kopiert"));
                     self.copy_button(ui, "link", label, done, url.clone(), true);
@@ -720,6 +720,18 @@ fn code_boxes(ui: &mut Ui, chars: impl Iterator<Item = char>, filled: bool) {
 fn dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// explorer.exe drops URLs with a query string and opens Documents instead.
+fn open_in_browser(url: &str) -> bool {
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (verb, file) = (wide("open"), wide(url));
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    let result = unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+    };
+    result as usize > 32
 }
 
 impl eframe::App for AdapterApp {
