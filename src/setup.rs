@@ -6,13 +6,22 @@ use std::path::{Path, PathBuf};
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
-const INSTALL_DIRS: [&str; 2] = [
+const INSTALL_DIRS: [&str; 4] = [
     r"C:\Program Files\sixteentons entertainment\Emergency4",
     r"C:\Program Files (x86)\sixteentons entertainment\Emergency4",
+    r"C:\Program Files\sixteen tons entertainment\Emergency 4 Deluxe",
+    r"C:\Program Files (x86)\sixteen tons entertainment\Emergency 4 Deluxe",
 ];
 
+/// The Deluxe edition ships its exe as Em4Deluxe.exe and won't start under another name.
+pub const GAME_EXES: [&str; 2] = ["Em4.exe", "Em4Deluxe.exe"];
+
+pub fn game_exe(dir: &Path) -> Option<PathBuf> {
+    GAME_EXES.iter().map(|name| dir.join(name)).find(|exe| exe.is_file())
+}
+
 pub fn is_game_dir(dir: &Path) -> bool {
-    dir.join("Em4.exe").is_file()
+    game_exe(dir).is_some()
 }
 
 /// A mod ships the adapter inside the game folder, so the exe's own parents come first,
@@ -114,6 +123,9 @@ mod tests {
 
         let exe = lst.join("AUBLstAdapter.exe");
         assert_eq!(find_game_dir(&exe), Some(root.join("Game")));
+        fs::create_dir_all(root.join("Deluxe")).unwrap();
+        fs::write(root.join(r"Deluxe\Em4Deluxe.exe"), "").unwrap();
+        assert_eq!(game_exe(&root.join("Deluxe")), Some(root.join(r"Deluxe\Em4Deluxe.exe")));
         assert_eq!(find_config(&exe, None, mod_id), Some(lst.join("AUBMP.cfg")));
 
         // Started from elsewhere: the config in Mods wins, the language copies sit too

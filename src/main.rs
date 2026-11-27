@@ -203,7 +203,7 @@ impl AdapterApp {
         self.game_dir_state = if !dir.is_dir() {
             Pick::Missing
         } else if !setup::is_game_dir(dir) {
-            Pick::Broken("Hier liegt keine Em4.exe".into())
+            Pick::Broken("Hier liegt keine Em4.exe oder Em4Deluxe.exe".into())
         } else {
             Pick::Ok
         };
@@ -312,7 +312,7 @@ impl AdapterApp {
 
     fn run_game(&self) {
         let Some(config) = &self.config else { return };
-        let exe = Path::new(&self.game_dir).join("Em4.exe");
+        let Some(exe) = setup::game_exe(Path::new(&self.game_dir)) else { return };
         let result = std::process::Command::new(&exe)
             .args(["-game", "-mod", &plain(&config.mod_id)])
             .current_dir(&self.game_dir)
@@ -543,7 +543,7 @@ impl AdapterApp {
             ui.label(RichText::new(note).color(theme::DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let can_start = matches!(self.game_dir_state, Pick::Ok) && self.config.is_some() && !self.game_running;
-                let hover = if self.game_running { "Em4.exe läuft schon" } else { "Erst Spielordner und Config wählen" };
+                let hover = if self.game_running { "Das Spiel läuft schon" } else { "Erst Spielordner und Config wählen" };
                 let button = egui::Button::new(with_icon(icon::PLAY, "Spiel starten"));
                 if ui.add_enabled(can_start, button).on_disabled_hover_text(hover).clicked() {
                     self.run_game();

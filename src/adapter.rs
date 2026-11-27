@@ -857,7 +857,7 @@ fn send_log(s: &Session) {
     }
 }
 
-/// Whether Em4.exe runs. A closed game leaves its log untouched, so the log alone can't
+/// Whether the game (Em4.exe or Em4Deluxe.exe) runs. A closed game leaves its log untouched, so the log alone can't
 /// tell that the round is over; only the next game's handshake would, and that one
 /// wipes whatever was delivered in between.
 pub fn game_running() -> bool {
@@ -877,7 +877,8 @@ pub fn game_running() -> bool {
         let mut more = Process32FirstW(snapshot, &mut entry) != 0;
         while more {
             let len = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
-            if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("Em4.exe") {
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if crate::setup::GAME_EXES.iter().any(|exe| name.eq_ignore_ascii_case(exe)) {
                 found = true;
                 break;
             }
