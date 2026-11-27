@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
@@ -13,6 +13,8 @@ pub const LOG_FILE: &str = "logfile.txt";
 const MARKER: &str = "!LSTcmd::";
 const PLAYER_MARKER: &str = "advertising game info: players=";
 const LOG_LINES: usize = 1000;
+/// The mod repeats its feature line about every ten seconds; older means it stopped.
+const FEATURES_FRESH: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Level {
@@ -135,6 +137,8 @@ pub struct Shared {
     /// The window log as it goes to the server, already scrubbed. Emptied by `reset`,
     /// so nothing from before the session reaches it.
     pub outbox: VecDeque<Value>,
+    /// The mod's last feature line and when it came.
+    pub game_features: Option<(Value, Instant)>,
 }
 
 impl Shared {
@@ -488,6 +492,7 @@ pub struct Batch {
     players: Map<String, Value>,
     time: Map<String, Value>,
     rejections: u32,
+    pub features: Option<Value>,
 }
 
 /// How often the server may answer a sync without "ok" before the batch is dropped.
@@ -531,6 +536,7 @@ impl Batch {
             'h' => merge(&mut self.hospitals, data, "game_hospital_id"),
             'm' => self.messages.push(Value::Object(data)),
             't' => self.time = data,
+            'f' => self.features = Some(Value::Object(data)),
             _ => {}
         }
         None
@@ -793,7 +799,11 @@ fn take_lines(s: &Session, batch: &mut Batch, lines: &[String], restarted: bool,
         }
     });
     for line in lines {
-        if let Some(handshake) = batch.process_line(line) {
+        let handshake = batch.process_line(line);
+        if let Some(features) = batch.features.take() {
+            s.update(|sh| sh.game_features = Some((features, Instant::now())));
+        }
+        if let Some(handshake) = handshake {
             match s.handshake(&handshake) {
                 Ok(()) => {
                     *awaiting_handshake = false;
@@ -839,11 +849,7 @@ pub fn run_log_uploader(s: Session) {
 fn send_log(s: &Session) {
     // Goes along every time, even without entries: the dispatch shows from it whether
     // a command can reach the game right now.
-    let status = json!({
-        "game": game_running(),
-        "round": s.shared.lock().unwrap().round_since.is_some(),
-        "version": env!("CARGO_PKG_VERSION"),
-    });
+    let status = adapter_status(&s.shared.lock().unwrap(), game_running());
     let mut first = true;
     loop {
         let chunk: Vec<Value> = {
@@ -874,6 +880,23 @@ fn send_log(s: &Session) {
 /// Whether the game (Em4.exe or Em4Deluxe.exe) runs. A closed game leaves its log untouched, so the log alone can't
 /// tell that the round is over; only the next game's handshake would, and that one
 /// wipes whatever was delivered in between.
+/// `game_command` tells AUBLst this adapter passes game commands through; it only uses
+/// them for codes the mod lists in `game_features`.
+fn adapter_status(sh: &Shared, game: bool) -> Value {
+    let mut status = json!({
+        "game": game,
+        "round": sh.round_since.is_some(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "game_command": 1,
+    });
+    if let Some((features, seen)) = &sh.game_features
+        && seen.elapsed() <= FEATURES_FRESH
+    {
+        status["game_features"] = features.clone();
+    }
+    status
+}
+
 pub fn game_running() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -1032,6 +1055,24 @@ mod tests {
         assert_eq!(command_line(&cmd("game_command", json!({ "code": 501, "fields": [""] }))).unwrap(), "501||");
         assert_eq!(command_line(&cmd("game_command", json!({ "code": "x", "fields": [] }))), None);
         assert_eq!(command_line(&cmd("game_command", json!({ "fields": [] }))), None);
+    }
+
+    #[test]
+    fn feature_line_is_kept_for_the_status() {
+        let mut b = Batch::default();
+        assert_eq!(b.process_line(r#"!LSTcmd::f{"commands":[501,505]}"#), None);
+        assert_eq!(b.features.take(), Some(json!({ "commands": [501, 505] })));
+    }
+
+    #[test]
+    fn status_reports_features_only_while_fresh() {
+        let mut sh = Shared::default();
+        assert_eq!(adapter_status(&sh, true)["game_command"], 1);
+        assert!(adapter_status(&sh, true).get("game_features").is_none());
+        sh.game_features = Some((json!({ "commands": [501] }), Instant::now()));
+        assert_eq!(adapter_status(&sh, true)["game_features"], json!({ "commands": [501] }));
+        sh.game_features = Some((json!({ "commands": [501] }), Instant::now() - Duration::from_secs(31)));
+        assert!(adapter_status(&sh, true).get("game_features").is_none());
     }
 
     #[test]
