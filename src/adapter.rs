@@ -397,6 +397,12 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// `text` for one field of a game line: a `|` or line break would split the line, and the
+/// mod would misread every command after it.
+fn field_text(v: &Value) -> String {
+    text(v).replace(['|', '\r', '\n'], " ")
+}
+
 fn present(v: Option<&Value>) -> Option<&Value> {
     v.filter(|v| !v.is_null())
 }
@@ -406,19 +412,19 @@ fn present(v: Option<&Value>) -> Option<&Value> {
 /// those stay unacknowledged.
 pub fn command_line(cmd: &Value) -> Option<String> {
     let payload = payload(cmd)?;
-    let field = |key: &str| payload.get(key).map(text);
+    let field = |key: &str| payload.get(key).map(field_text);
     let event_id = present(payload.get("event_game_id"))
         .or(present(payload.get("event_id")))
-        .map_or("-1".to_string(), text);
+        .map_or("-1".to_string(), field_text);
     let target = || {
         let t = payload.get("target")?;
-        Some((text(t.get("x")?), text(t.get("y")?)))
+        Some((field_text(t.get("x")?), field_text(t.get("y")?)))
     };
 
     Some(match cmd["type"].as_str()? {
         "assign" => {
             let player = present(payload.get("assign_to_player_id"))
-                .map(text)
+                .map(field_text)
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| "-1".into());
             let mode = field("mode").unwrap_or_else(|| "-1".into());
@@ -433,6 +439,13 @@ pub fn command_line(cmd: &Value) -> Option<String> {
         "event_delete" => format!("112|{}|{}|", field("event_id")?, field("event_game_id")?),
         "message_create" => format!("311|{event_id}|{}|{}|", field("short_message")?, field("long_message")?),
         "message_revoke" => format!("312|{event_id}|{}|", field("short_message")?),
+        // Codes and fields come from AUBLst unchanged, so a submod gets new commands
+        // without a new adapter.
+        "game_command" => {
+            let code = payload.get("code")?.as_i64()?;
+            let fields: String = payload.get("fields")?.as_array()?.iter().map(|f| field_text(f) + "|").collect();
+            format!("{code}|{fields}")
+        }
         _ => return None,
     })
 }
@@ -460,6 +473,7 @@ fn describe(cmd: &Value) -> String {
         "event_delete" => format!("Einsatz {} gelöscht", f("event_id")),
         "message_create" => format!("Meldung „{}“", f("short_message")),
         "message_revoke" => format!("Meldung „{}“ zurückgezogen", f("short_message")),
+        "game_command" => format!("Befehl {}", f("code")),
         other => other.to_string(),
     }
 }
@@ -1009,6 +1023,22 @@ mod tests {
         assert_eq!(command_line(&cmd("unknown", json!({}))), None);
         assert_eq!(command_line(&cmd("unassign", json!({}))), None);
         assert_eq!(command_line(&cmd("assign", json!({ "game_vehicle_id": 1 }))), None);
+    }
+
+    #[test]
+    fn game_commands_pass_through() {
+        assert_eq!(command_line(&cmd("game_command", json!({ "code": 505, "fields": ["1_RTW_A", 2] }))).unwrap(), "505|1_RTW_A|2|");
+        assert_eq!(command_line(&cmd("game_command", json!({ "code": 501, "fields": ["505,506"] }))).unwrap(), "501|505,506|");
+        assert_eq!(command_line(&cmd("game_command", json!({ "code": 501, "fields": [""] }))).unwrap(), "501||");
+        assert_eq!(command_line(&cmd("game_command", json!({ "code": "x", "fields": [] }))), None);
+        assert_eq!(command_line(&cmd("game_command", json!({ "fields": [] }))), None);
+    }
+
+    #[test]
+    fn separators_never_split_a_line() {
+        let line = command_line(&cmd("event_create", json!({ "event_id": 3, "name": "Brand|A\nB", "target": { "x": 1, "y": 2 } }))).unwrap();
+        assert_eq!(line, "110|3|1|2|Brand A B|");
+        assert_eq!(command_line(&cmd("game_command", json!({ "code": 506, "fields": ["1|RTW\r"] }))).unwrap(), "506|1 RTW |");
     }
 
     #[test]
