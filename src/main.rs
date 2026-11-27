@@ -545,8 +545,13 @@ impl AdapterApp {
             self.check_game_dir();
         }
         let shown = adapter::beside_exe(&self.config_path).display().to_string();
+        // The configs live in the mod folders, so without one yet the game folder is the better start.
+        let start = match Path::new(&shown).parent() {
+            Some(dir) if !self.config_path.is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from(&self.game_dir),
+        };
         if Self::pick_box(ui, "Config", (icon::FILE, icon::FILE), &shown, &self.config_state, !connected)
-            && let Some(file) = rfd::FileDialog::new().add_filter("Config", &["cfg"]).pick_file()
+            && let Some(file) = rfd::FileDialog::new().add_filter("Config", &["cfg"]).set_directory(start).pick_file()
         {
             self.config_path = file.display().to_string();
             write_setting(REG_CONFIG, &self.config_path);
