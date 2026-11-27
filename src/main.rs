@@ -438,26 +438,46 @@ impl AdapterApp {
             });
         });
 
-        egui::Frame::new()
-            .fill(theme::FIELD)
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(4)
-            .inner_margin(Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.set_min_height(28.0);
-                    if connected {
-                        ui.label(RichText::new(grouped(&self.token)).monospace().size(19.0).color(theme::GOOD));
+        // AUBLst's four characters get a box each, like a PIN field. Older servers may hand
+        // out longer codes, those stay one grouped line.
+        let code = match &self.session {
+            // AUBLst lowercases every code it reads, so capitals are safe there and can't
+            // be misread; other servers may compare as is.
+            Some(s) if matches!(s.api, Api::V1(_)) => self.token.to_uppercase(),
+            _ => self.token.clone(),
+        };
+        if !connected || code.chars().count() <= 8 {
+            ui.horizontal(|ui| {
+                if connected {
+                    code_boxes(ui, code.chars(), true);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let token = self.token.clone();
+                        self.copy_button(ui, "code", icon::COPY.into(), icon::CHECK.into(), token, true);
+                    });
+                } else {
+                    code_boxes(ui, "····".chars(), false);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Noch kein Code").size(15.0).color(theme::HINT));
+                }
+            });
+        } else {
+            egui::Frame::new()
+                .fill(theme::FIELD)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(28.0);
+                        ui.label(RichText::new(grouped(&code)).monospace().size(19.0).color(theme::GOOD));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let token = self.token.clone();
                             self.copy_button(ui, "code", icon::COPY.into(), icon::CHECK.into(), token, true);
                         });
-                    } else {
-                        ui.label(RichText::new("Noch kein Code").size(17.0).color(theme::HINT));
-                    }
+                    });
                 });
-            });
+        }
 
         if let Some(url) = self.dispatch_url().filter(|_| connected) {
             ui.horizontal(|ui| {
@@ -680,6 +700,21 @@ fn fold_header(ui: &mut Ui, open: bool, add: impl FnOnce(&mut Ui)) -> bool {
         add(ui);
     });
     row.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// One box per character. `filled` paints them in the connected green.
+fn code_boxes(ui: &mut Ui, chars: impl Iterator<Item = char>, filled: bool) {
+    let (fill, stroke, text, size) = if filled {
+        (theme::GOOD.gamma_multiply(0.07), theme::GOOD.gamma_multiply(0.55), theme::GOOD, 28.0)
+    } else {
+        (theme::FIELD, theme::BORDER, theme::HINT, 18.0)
+    };
+    for c in chars {
+        let (rect, _) = ui.allocate_exact_size(vec2(48.0, 56.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect(rect, 6, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, c, egui::FontId::monospace(size), text);
+    }
 }
 
 fn dot(ui: &mut Ui, color: Color32) {
