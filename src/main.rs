@@ -313,8 +313,9 @@ impl AdapterApp {
     fn run_game(&self) {
         let Some(config) = &self.config else { return };
         let Some(exe) = setup::game_exe(Path::new(&self.game_dir)) else { return };
+        let folder = setup::mod_folder(&adapter::beside_exe(&self.config_path)).unwrap_or_else(|| plain(&config.mod_id));
         let result = std::process::Command::new(&exe)
-            .args(["-game", "-mod", &plain(&config.mod_id)])
+            .args(["-game", "-mod", &folder])
             .current_dir(&self.game_dir)
             .spawn();
         if let Err(e) = result {

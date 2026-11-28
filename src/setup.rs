@@ -52,7 +52,7 @@ pub fn find_config(exe: &Path, game_dir: Option<&Path>, mod_id: impl Fn(&Path) -
         found.retain(|(_, p)| {
             let folder = p.strip_prefix(&mods).ok().and_then(|rel| rel.components().next());
             let folder = folder.map(|c| c.as_os_str().to_string_lossy().into_owned());
-            mod_id(p).zip(folder).is_some_and(|(id, folder)| id.eq_ignore_ascii_case(&folder))
+            mod_id(p).zip(folder).is_some_and(|(id, folder)| names_folder(&id, &folder))
         });
     }
     found.sort();
@@ -60,6 +60,20 @@ pub fn find_config(exe: &Path, game_dir: Option<&Path>, mod_id: impl Fn(&Path) -
         [(depth, path), rest @ ..] if rest.first().is_none_or(|(d, _)| d > depth) => Some(path.clone()),
         _ => None,
     }
+}
+
+/// Mod ids can't hold spaces (the server takes `[A-Za-z0-9_.-]`), so `AUBMP_Hypax_Submod`
+/// names the folder `AUBMP Hypax Submod`.
+fn names_folder(id: &str, folder: &str) -> bool {
+    id.replace('_', " ").eq_ignore_ascii_case(&folder.replace('_', " "))
+}
+
+/// The mod folder a config sits in (`...\Mods\<folder>\...`): what `-mod` has to start,
+/// which for a submod isn't its mod id.
+pub fn mod_folder(config: &Path) -> Option<String> {
+    let parts: Vec<String> = config.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let at = parts.iter().rposition(|p| p.eq_ignore_ascii_case("Mods"))?;
+    parts.get(at + 1).filter(|_| at + 2 < parts.len()).cloned()
 }
 
 fn cfg_files(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<(usize, PathBuf)>) {
@@ -135,6 +149,16 @@ mod tests {
         fs::write(copy.join("AUBMP.cfg"), "AUBMP").unwrap();
         let elsewhere = root.join(r"Downloads\AUBLstAdapter.exe");
         assert_eq!(find_config(&elsewhere, Some(&root.join("Game")), mod_id), Some(lst.join("AUBMP.cfg")));
+        assert_eq!(mod_folder(&lst.join("AUBMP.cfg")).as_deref(), Some("AUBMP"));
+        assert_eq!(mod_folder(&elsewhere.with_file_name("config.cfg")), None);
+
+        // A submod's id spells its folder with underscores.
+        let submod = root.join(r"Game\Mods\AUBMP Hypax Submod\4_LST");
+        fs::create_dir_all(&submod).unwrap();
+        fs::write(submod.join("AUBMP.cfg"), "AUBMP_Hypax_Submod").unwrap();
+        fs::remove_dir_all(root.join(r"Game\Mods\AUBMP")).unwrap();
+        assert_eq!(find_config(&elsewhere, Some(&root.join("Game")), mod_id), Some(submod.join("AUBMP.cfg")));
+        assert_eq!(mod_folder(&submod.join("AUBMP.cfg")).as_deref(), Some("AUBMP Hypax Submod"));
 
         // Two fitting mods at the same height: no guess.
         fs::create_dir_all(root.join(r"Game\Mods\Other\4_LST")).unwrap();
